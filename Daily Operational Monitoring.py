@@ -445,6 +445,9 @@ def load_data(view_type, year=None, month=None, date_obj=None):
 
     if query_year in onedrive_links:
         file_url = onedrive_links[query_year]
+        if "여기에" in file_url:
+            # 아직 2025년 링크가 입력되지 않은 경우, 서버가 뻗지 않도록 빈 데이터로 조용히 넘깁니다.
+            return create_empty_df(), create_empty_summary_data(), None
     else:
         st.error(f"{query_year}년도의 원드라이브 링크가 코드에 설정되지 않았습니다.")
         return create_empty_df(), create_empty_summary_data(), None
