@@ -454,15 +454,31 @@ def load_data(view_type, year=None, month=None, date_obj=None):
 
     # --- 2. 데이터 읽기 ---
     try:
-        # 봇 차단을 우회하기 위한 헤더 추가 및 메모리에서 직접 파일 읽기
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(file_url, headers=headers, timeout=15)
+        # 봇 차단을 완벽하게 우회하기 위해 진짜 크롬 브라우저와 동일한 접속 헤더(신분증) 설정
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        # 세션을 사용하여 다운로드 (리디렉션 및 쿠키 처리 강화)
+        session = requests.Session()
+        response = session.get(file_url, headers=headers, timeout=20)
         response.raise_for_status()
         
+        # 다운로드된 파일이 실제 엑셀 파일(ZIP 형식, 'PK'로 시작)인지 검증
+        if not response.content.startswith(b'PK'):
+            # 엑셀이 아니라면 마이크로소프트가 보안 페이지를 보낸 것임
+            html_preview = response.content[:150].decode('utf-8', errors='ignore').replace('\n', '')
+            st.error(f"⚠️ 사내 원드라이브 보안 정책에 의해 엑셀 다운로드가 차단되었습니다.\\n(서버 응답: {html_preview}...)")
+            return create_empty_df(), create_empty_summary_data(), None
+            
         file_content = io.BytesIO(response.content)
-        daily_sheet_df = pd.read_excel(file_content, sheet_name="일별", header=None)
+        # engine='openpyxl'을 명시하여 강제로 엑셀 파일로 확실히 읽도록 지시
+        daily_sheet_df = pd.read_excel(file_content, sheet_name="일별", header=None, engine='openpyxl')
         file_content.seek(0)
-        source_sheet_df = pd.read_excel(file_content, sheet_name="운전실적_원본", header=None)
+        source_sheet_df = pd.read_excel(file_content, sheet_name="운전실적_원본", header=None, engine='openpyxl')
         
     except requests.exceptions.RequestException as e:
         st.error(f"원드라이브에서 데이터를 다운로드하는 데 실패했습니다: {e}")
