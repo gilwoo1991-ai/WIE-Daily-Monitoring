@@ -455,6 +455,7 @@ def load_data(view_type, year=None, month=None, date_obj=None):
         response = requests.get(file_url, timeout=15)
         response.raise_for_status()
         
+        file_content = io.BytesIO(response.content)
         daily_sheet_df = pd.read_excel(file_content, sheet_name="일별", header=None, engine='openpyxl')
         file_content.seek(0)
         source_sheet_df = pd.read_excel(file_content, sheet_name="운전실적_원본", header=None, engine='openpyxl')
