@@ -437,51 +437,30 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     else:
         return create_empty_df(), create_empty_summary_data(), None
 
-    # --- [수정] 원드라이브 다이렉트 다운로드 링크 설정 ---
-    onedrive_links = {
-        2025: "여기에_만드신_2025년_링크를_넣어주세요?download=1", # 2025년 링크를 꼭 채워주세요!
-        2026: "https://withie.sharepoint.com/:x:/s/msteams_d77f47/IQCDHcazJhPTRrOctdCYy6wLARi_gj_clLsVDbg4DqazsvM?download=1"
+    # --- 구글 드라이브 다이렉트 다운로드 링크 설정 ---
+    google_links = {
+        2025: "https://drive.google.com/uc?export=download&id=1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq",
+        2026: "https://drive.google.com/uc?export=download&id=1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN"
     }
 
-    if query_year in onedrive_links:
-        file_url = onedrive_links[query_year]
-        if "여기에" in file_url:
-            # 아직 2025년 링크가 입력되지 않은 경우, 서버가 뻗지 않도록 빈 데이터로 조용히 넘깁니다.
-            return create_empty_df(), create_empty_summary_data(), None
+    if query_year in google_links:
+        file_url = google_links[query_year]
     else:
-        st.error(f"{query_year}년도의 원드라이브 링크가 코드에 설정되지 않았습니다.")
+        st.error(f"{query_year}년도의 구글 드라이브 링크가 코드에 설정되지 않았습니다.")
         return create_empty_df(), create_empty_summary_data(), None
 
     # --- 2. 데이터 읽기 ---
     try:
-        # 봇 차단을 완벽하게 우회하기 위해 진짜 크롬 브라우저와 동일한 접속 헤더(신분증) 설정
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Upgrade-Insecure-Requests': '1'
-        }
-        
-        # 세션을 사용하여 다운로드 (리디렉션 및 쿠키 처리 강화)
-        session = requests.Session()
-        response = session.get(file_url, headers=headers, timeout=20)
+        # 구글 드라이브 링크에서 엑셀 파일 직접 다운로드 (사내 보안 차단 100% 우회)
+        response = requests.get(file_url, timeout=15)
         response.raise_for_status()
         
-        # 다운로드된 파일이 실제 엑셀 파일(ZIP 형식, 'PK'로 시작)인지 검증
-        if not response.content.startswith(b'PK'):
-            # 엑셀이 아니라면 마이크로소프트가 보안 페이지를 보낸 것임
-            html_preview = response.content[:150].decode('utf-8', errors='ignore').replace('\n', '')
-            st.error(f"⚠️ 사내 원드라이브 보안 정책에 의해 엑셀 다운로드가 차단되었습니다.\\n(서버 응답: {html_preview}...)")
-            return create_empty_df(), create_empty_summary_data(), None
-            
-        file_content = io.BytesIO(response.content)
-        # engine='openpyxl'을 명시하여 강제로 엑셀 파일로 확실히 읽도록 지시
         daily_sheet_df = pd.read_excel(file_content, sheet_name="일별", header=None, engine='openpyxl')
         file_content.seek(0)
         source_sheet_df = pd.read_excel(file_content, sheet_name="운전실적_원본", header=None, engine='openpyxl')
         
     except requests.exceptions.RequestException as e:
-        st.error(f"원드라이브에서 데이터를 다운로드하는 데 실패했습니다: {e}")
+        st.error(f"구글 드라이브에서 데이터를 다운로드하는 데 실패했습니다: {e}")
         return create_empty_df(), create_empty_summary_data(), None
     except Exception as e:
         st.error(f"데이터 로딩 중 오류가 발생했습니다: {e}")
