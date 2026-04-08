@@ -7,6 +7,7 @@ import base64
 import requests
 from openpyxl.utils import column_index_from_string
 import os
+import io
 
 # 1. 페이지 설정 (넓은 화면 모드)
 st.set_page_config(
@@ -436,17 +437,32 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     else:
         return create_empty_df(), create_empty_summary_data(), None
 
-    # 배포 환경을 위한 상대 경로 설정 (현재 Python 파일과 동일한 위치)
-    base_path = os.path.dirname(os.path.abspath(__file__))
-    file_name = f"환경 관련 가동현황 ({query_year}년).xlsx"
-    file_path = os.path.join(base_path, file_name)
+    # --- [수정] 원드라이브 다이렉트 다운로드 링크 설정 ---
+    onedrive_links = {
+        2025: "여기에_2025년_엑셀파일_공유링크를_넣어주세요?download=1", # 2025년 링크도 같은 방식으로 만들어서 넣어주세요.
+        2026: "https://withie.sharepoint.com/:x:/s/msteams_d77f47/IQCDHcazJhPTRrOctdCYy6wLARi_gj_clLsVDbg4DqazsvM?download=1"
+    }
+
+    if query_year in onedrive_links:
+        file_url = onedrive_links[query_year]
+    else:
+        st.error(f"{query_year}년도의 원드라이브 링크가 코드에 설정되지 않았습니다.")
+        return create_empty_df(), create_empty_summary_data(), None
 
     # --- 2. 데이터 읽기 ---
     try:
-        daily_sheet_df = pd.read_excel(file_path, sheet_name="일별", header=None)
-        source_sheet_df = pd.read_excel(file_path, sheet_name="운전실적_원본", header=None)
-    except FileNotFoundError:
-        st.error(f"파일을 찾을 수 없습니다: '{file_name}'. 파이썬 스크립트와 같은 폴더에 파일이 있는지 확인해주세요.")
+        # 봇 차단을 우회하기 위한 헤더 추가 및 메모리에서 직접 파일 읽기
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(file_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        file_content = io.BytesIO(response.content)
+        daily_sheet_df = pd.read_excel(file_content, sheet_name="일별", header=None)
+        file_content.seek(0)
+        source_sheet_df = pd.read_excel(file_content, sheet_name="운전실적_원본", header=None)
+        
+    except requests.exceptions.RequestException as e:
+        st.error(f"원드라이브에서 데이터를 다운로드하는 데 실패했습니다: {e}")
         return create_empty_df(), create_empty_summary_data(), None
     except Exception as e:
         st.error(f"데이터 로딩 중 오류가 발생했습니다: {e}")
