@@ -437,22 +437,34 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     else:
         return create_empty_df(), create_empty_summary_data(), None
 
-    # --- 구글 드라이브 다이렉트 다운로드 링크 설정 ---
-    google_links = {
-        2025: "https://docs.google.com/spreadsheets/d/1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq/export?format=xlsx",
-        2026: "https://docs.google.com/spreadsheets/d/1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN/export?format=xlsx"
+    # --- 구글 드라이브 파일 ID 설정 ---
+    google_file_ids = {
+        2025: "1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq",
+        2026: "1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN"
     }
 
-    if query_year in google_links:
-        file_url = google_links[query_year]
+    if query_year in google_file_ids:
+        file_id = google_file_ids[query_year]
     else:
         st.error(f"{query_year}년도의 구글 드라이브 링크가 코드에 설정되지 않았습니다.")
         return create_empty_df(), create_empty_summary_data(), None
 
     # --- 2. 데이터 읽기 ---
     try:
-        # 구글 드라이브 링크에서 엑셀 파일 직접 다운로드 (사내 보안 차단 100% 우회)
-        response = requests.get(file_url, timeout=15)
+        # 구글 드라이브 바이러스 검사 경고(HTML) 우회 다운로드 로직
+        download_url = "https://drive.google.com/uc?export=download"
+        session = requests.Session()
+        response = session.get(download_url, params={'id': file_id}, stream=True, timeout=15)
+        
+        # 경고 페이지가 떴을 경우 쿠키에서 확인 토큰(confirm token) 추출하여 재요청
+        token = None
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                token = value
+                break
+        if token:
+            response = session.get(download_url, params={'id': file_id, 'confirm': token}, stream=True, timeout=15)
+            
         response.raise_for_status()
         
         file_content = io.BytesIO(response.content)
