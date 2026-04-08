@@ -439,8 +439,8 @@ def load_data(view_type, year=None, month=None, date_obj=None):
 
     # --- 구글 드라이브 다이렉트 다운로드 링크 설정 ---
     google_links = {
-        2025: "https://drive.google.com/uc?export=download&id=1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq",
-        2026: "https://drive.google.com/uc?export=download&id=1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN"
+        2025: "https://docs.google.com/spreadsheets/d/1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq/export?format=xlsx",
+        2026: "https://docs.google.com/spreadsheets/d/1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN/export?format=xlsx"
     }
 
     if query_year in google_links:
