@@ -8,9 +8,6 @@ import requests
 from openpyxl.utils import column_index_from_string
 import os
 import io
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 
 # 1. 페이지 설정 (넓은 화면 모드)
 st.set_page_config(
@@ -409,29 +406,6 @@ def pty_to_weather(pty_code):
     }
     return pty_map.get(str(pty_code), ("-", "정보 없음"))
 
-# --- [신규] 구글 드라이브 파일 다운로드 함수 ---
-@st.cache_data(ttl=600)
-def download_excel_from_gdrive(file_id):
-    """구글 드라이브에서 엑셀 파일을 다운로드하여 메모리 버퍼(BytesIO)로 반환합니다."""
-    try:
-        creds_dict = st.secrets["gcp_service_account"]
-        credentials = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive.readonly']
-        )
-        service = build('drive', 'v3', credentials=credentials)
-        request = service.files().get_media(fileId=file_id)
-        file_io = io.BytesIO()
-        downloader = MediaIoBaseDownload(file_io, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        file_io.seek(0)
-        return file_io
-    except Exception as e:
-        st.error(f"구글 드라이브 연동 중 오류가 발생했습니다: {e}")
-        return None
-
 # 4. 데이터 로드 함수
 @st.cache_data(ttl=600) # 10분마다 데이터 새로고침
 def load_data(view_type, year=None, month=None, date_obj=None):
@@ -463,25 +437,26 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     else:
         return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
 
-    # --- 데이터 소스 설정 (구글 드라이브 File ID) ---
+    # --- 데이터 소스 설정 (구글 드라이브 직접 다운로드) ---
+    # 파일 공유 설정을 "링크가 있는 모든 사용자 보기 가능"으로 한 후 파일 ID를 입력하세요.
     file_ids = {
-        2025: st.secrets["gdrive_files"]["file_id_2025"],
-        2026: st.secrets["gdrive_files"]["file_id_2026"]
+        2025: "여기에_2025년_엑셀파일_ID를_넣어주세요",
+        2026: "여기에_2026년_엑셀파일_ID를_넣어주세요"
     }
 
-    if query_year in file_ids:
-        file_id = file_ids[query_year]
-    else:
-        st.error(f"{query_year}년도의 구글 드라이브 파일 ID가 설정되지 않았습니다.")
+    if query_year not in file_ids or "여기에" in file_ids[query_year]:
+        st.error(f"코드에 {query_year}년도의 구글 드라이브 파일 ID가 입력되지 않았습니다.")
         return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
 
-    # --- 2. 데이터 읽기 ---
+    # --- 2. 구글 드라이브 파일 읽기 ---
     try:
-        # 구글 드라이브에서 파일 다운로드
-        file_data = download_excel_from_gdrive(file_id)
-        if file_data is None:
-            return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
-            
+        file_id = file_ids[query_year]
+        url = f"https://drive.google.com/uc?id={file_id}&export=download"
+        
+        response = requests.get(url)
+        response.raise_for_status()
+        file_data = io.BytesIO(response.content)
+
         daily_sheet_df = pd.read_excel(file_data, sheet_name="일별", header=None, engine='openpyxl')
         file_data.seek(0) # 버퍼 위치 초기화 후 두 번째 시트 읽기
         source_sheet_df = pd.read_excel(file_data, sheet_name="운전실적_원본", header=None, engine='openpyxl')
