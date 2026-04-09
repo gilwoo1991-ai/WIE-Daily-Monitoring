@@ -8,6 +8,9 @@ import requests
 from openpyxl.utils import column_index_from_string
 import os
 import io
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 # 1. 페이지 설정 (넓은 화면 모드)
 st.set_page_config(
@@ -78,7 +81,7 @@ with top_left_col:
     if selected_tab == "기간별 운영 현황":
         selected_sub_tab = st.segmented_control(
             "시설 현황 메뉴",
-            ["📈 대기배출시설 현황", "💧 폐수배출시설 현황"],
+            ["📈 대기배출시설 현황", "💧 폐수배출시설 현황", "♨️ 외부수열 현황"],
             default="📈 대기배출시설 현황",
             selection_mode="single",
             label_visibility="collapsed",
@@ -406,6 +409,29 @@ def pty_to_weather(pty_code):
     }
     return pty_map.get(str(pty_code), ("-", "정보 없음"))
 
+# --- [신규] 구글 드라이브 파일 다운로드 함수 ---
+@st.cache_data(ttl=600)
+def download_excel_from_gdrive(file_id):
+    """구글 드라이브에서 엑셀 파일을 다운로드하여 메모리 버퍼(BytesIO)로 반환합니다."""
+    try:
+        creds_dict = st.secrets["gcp_service_account"]
+        credentials = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        service = build('drive', 'v3', credentials=credentials)
+        request = service.files().get_media(fileId=file_id)
+        file_io = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_io, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        file_io.seek(0)
+        return file_io
+    except Exception as e:
+        st.error(f"구글 드라이브 연동 중 오류가 발생했습니다: {e}")
+        return None
+
 # 4. 데이터 로드 함수
 @st.cache_data(ttl=600) # 10분마다 데이터 새로고침
 def load_data(view_type, year=None, month=None, date_obj=None):
@@ -424,60 +450,45 @@ def load_data(view_type, year=None, month=None, date_obj=None):
         start_date = datetime(year, month, 1).date()
         # 해당 월의 마지막 날 계산
         next_month = datetime(year, month, 1) + timedelta(days=32)
-        end_of_month = next_month.replace(day=1) - timedelta(days=1)
+        end_of_month = (next_month.replace(day=1) - timedelta(days=1)).date()
         # 조회 종료일이 어제를 넘지 않도록 조정
-        end_date = min(end_of_month.date(), yesterday_date)
+        end_date = min(end_of_month, yesterday_date)
         query_year = year
     elif view_type == '연별':
         if not year: return create_empty_df(), create_empty_summary_data(), None
         start_date = datetime(year, 1, 1).date()
         # 조회 종료일이 어제를 넘지 않도록 조정
-        end_date = min(datetime(year, 12, 31).date(), yesterday_date)
+        end_date = min(datetime(year, 12, 31).date(), yesterday_date) # .date() 추가
         query_year = year
     else:
-        return create_empty_df(), create_empty_summary_data(), None
+        return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
 
-    # --- 구글 드라이브 파일 ID 설정 ---
-    google_file_ids = {
-        2025: "1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq",
-        2026: "1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN"
+    # --- 데이터 소스 설정 (구글 드라이브 File ID) ---
+    file_ids = {
+        2025: st.secrets["gdrive_files"]["file_id_2025"],
+        2026: st.secrets["gdrive_files"]["file_id_2026"]
     }
 
-    if query_year in google_file_ids:
-        file_id = google_file_ids[query_year]
+    if query_year in file_ids:
+        file_id = file_ids[query_year]
     else:
-        st.error(f"{query_year}년도의 구글 드라이브 링크가 코드에 설정되지 않았습니다.")
-        return create_empty_df(), create_empty_summary_data(), None
+        st.error(f"{query_year}년도의 구글 드라이브 파일 ID가 설정되지 않았습니다.")
+        return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
 
     # --- 2. 데이터 읽기 ---
     try:
-        # 구글 드라이브 바이러스 검사 경고(HTML) 우회 다운로드 로직
-        download_url = "https://drive.google.com/uc?export=download"
-        session = requests.Session()
-        response = session.get(download_url, params={'id': file_id}, stream=True, timeout=15)
-        
-        # 경고 페이지가 떴을 경우 쿠키에서 확인 토큰(confirm token) 추출하여 재요청
-        token = None
-        for key, value in response.cookies.items():
-            if key.startswith('download_warning'):
-                token = value
-                break
-        if token:
-            response = session.get(download_url, params={'id': file_id, 'confirm': token}, stream=True, timeout=15)
+        # 구글 드라이브에서 파일 다운로드
+        file_data = download_excel_from_gdrive(file_id)
+        if file_data is None:
+            return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
             
-        response.raise_for_status()
+        daily_sheet_df = pd.read_excel(file_data, sheet_name="일별", header=None, engine='openpyxl')
+        file_data.seek(0) # 버퍼 위치 초기화 후 두 번째 시트 읽기
+        source_sheet_df = pd.read_excel(file_data, sheet_name="운전실적_원본", header=None, engine='openpyxl')
         
-        file_content = io.BytesIO(response.content)
-        daily_sheet_df = pd.read_excel(file_content, sheet_name="일별", header=None, engine='openpyxl')
-        file_content.seek(0)
-        source_sheet_df = pd.read_excel(file_content, sheet_name="운전실적_원본", header=None, engine='openpyxl')
-        
-    except requests.exceptions.RequestException as e:
-        st.error(f"구글 드라이브에서 데이터를 다운로드하는 데 실패했습니다: {e}")
-        return create_empty_df(), create_empty_summary_data(), None
     except Exception as e:
         st.error(f"데이터 로딩 중 오류가 발생했습니다: {e}")
-        return create_empty_df(), create_empty_summary_data(), None
+        return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
 
     # --- 3. 행 범위 계산 및 데이터 슬라이싱 ---
     HEADER_OFFSET = 5
@@ -540,6 +551,26 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     except Exception as e:
         st.warning(f"폐수 관련 총량 데이터를 집계하는 중 오류 발생: {e}")
         summary_data = create_empty_summary_data()
+
+    # --- 4-C. 외부수열 관련 총량 집계 ---
+    external_heat_summary = create_empty_external_heat_data() # Initialize with empty data
+
+    external_heat_cols = {
+        '남부소각장': 'AD',
+        'ERG': 'AE',
+        'SRF': 'AF',
+        '인천종합에너지': 'AG',
+        '안산도시개발': 'AH'
+    }
+
+    try:
+        for facility_name, col_letter in external_heat_cols.items():
+            col_idx = column_index_from_string(col_letter) - 1
+            heat_value = pd.to_numeric(source_data_slice.iloc[:, col_idx], errors='coerce').sum()
+            external_heat_summary[facility_name] = heat_value
+    except Exception as e:
+        st.warning(f"외부수열 관련 총량 데이터를 집계하는 중 오류 발생: {e}")
+        external_heat_summary = create_empty_external_heat_data() # Reset to empty if error
 
     # --- 4-B. 설비별 데이터 집계 ---
     final_data = {}
@@ -632,8 +663,8 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     df = pd.DataFrame.from_dict(final_data, orient='index')
     df.index.name = '구분' # Changed from '구분' to '구분'
     ordered_columns = ['가동 시간 (hr)', '연누적 가동 시간 (hr)', '열 생산량 (Gcal)', 'LNG 사용량 (m³)', '온실가스 배출량 (tCO₂)', 'NOx 배출량 (kg)']
-    df = df[ordered_columns]
-    return df, summary_data, end_date
+    df = df[ordered_columns] # Ensure all columns exist before indexing
+    return df, summary_data, external_heat_summary, end_date
 
 def create_empty_df():
     """데이터 로드 실패 시 사용할 빈 데이터프레임을 생성합니다."""
@@ -659,9 +690,20 @@ def create_empty_summary_data():
         '1차 냉각수량': 0
     }
 
+# --- [신규] 외부수열 관련 데이터 로드 실패 시 사용할 빈 딕셔너리를 생성합니다. ---
+def create_empty_external_heat_data():
+    """외부수열 관련 데이터 로드 실패 시 사용할 빈 딕셔너리를 생성합니다."""
+    return {
+        '남부소각장': 0,
+        'ERG': 0,
+        'SRF': 0,
+        '인천종합에너지': 0,
+        '안산도시개발': 0
+    }
+
 # --- [신규] 금일 운영 요약 팝업(Dialog) 함수 ---
 @st.dialog("📋 금일 운영 요약 리포트")
-def show_today_summary_dialog(df, summary, date_str):
+def show_today_summary_dialog(df, summary, external_heat_data, date_str):
     st.markdown(f"**기준일:** {date_str} (금일)")
     
     st.markdown("#### 📈 대기배출시설")
@@ -691,6 +733,19 @@ def show_today_summary_dialog(df, summary, date_str):
         with cols[i % 3]:
             val_str = f"{int(v):,}" if k in ["총 상수도 사용량", "순수 생산량", "방류수량"] else f"{float(v):,.1f}"
             st.metric(k, f"{val_str} {unit}")
+            
+    st.markdown("#### ♨️ 외부수열 현황")
+    eh_cols = st.columns(3)
+    eh_metrics = list(external_heat_data.items())
+    for i, (k, v) in enumerate(eh_metrics):
+        with eh_cols[i % 3]:
+            st.metric(k, f"{v:,.1f} Gcal")
+
+# [테스트용] 위드인천에너지 NOx 데이터 조회 (실시간 탭용)
+# API 함수는 인자를 사용하지 않으므로 None을 전달하여 항상 최신 데이터를 가져옵니다.
+test_nox_value = get_with_incheon_energy_test_nox_from_api(None)
+
+# --- 실시간 모니터링 탭 ---
 
 # [테스트용] 위드인천에너지 NOx 데이터 조회 (실시간 탭용)
 # API 함수는 인자를 사용하지 않으므로 None을 전달하여 항상 최신 데이터를 가져옵니다.
@@ -789,22 +844,22 @@ if selected_tab == "실시간 모니터링":
         now_date = datetime.now(kst).date()
         
         # 6개 기간 데이터 로드
-        target_date_prev2 = now_date - timedelta(days=2)
-        target_date_prev1 = now_date - timedelta(days=1)
+        target_date_prev2 = (now_date - timedelta(days=2))
+        target_date_prev1 = (now_date - timedelta(days=1))
         
-        df_prev_day, sum_prev_day, _ = load_data('일별', date_obj=target_date_prev2)
+        df_prev_day, sum_prev_day, eh_prev_day, _ = load_data('일별', date_obj=target_date_prev2)
         
-        df_today, sum_today, _ = load_data('일별', date_obj=target_date_prev1)
+        df_today, sum_today, eh_today, _ = load_data('일별', date_obj=target_date_prev1)
         
         lm_year = now_date.year if now_date.month > 1 else now_date.year - 1
         lm_month = now_date.month - 1 if now_date.month > 1 else 12
-        df_prev_month, sum_prev_month, _ = load_data('월별', year=lm_year, month=lm_month)
+        df_prev_month, sum_prev_month, eh_prev_month, _ = load_data('월별', year=lm_year, month=lm_month)
         
-        df_this_month, sum_this_month, _ = load_data('월별', year=now_date.year, month=now_date.month)
+        df_this_month, sum_this_month, eh_this_month, _ = load_data('월별', year=now_date.year, month=now_date.month)
         
-        df_prev_year, sum_prev_year, _ = load_data('연별', year=now_date.year - 1)
+        df_prev_year, sum_prev_year, eh_prev_year, _ = load_data('연별', year=now_date.year - 1)
         
-        df_this_year, sum_this_year, _ = load_data('연별', year=now_date.year)
+        df_this_year, sum_this_year, eh_this_year, _ = load_data('연별', year=now_date.year)
 
         periods = [
             ("전일", df_prev_day, sum_prev_day, target_date_prev2.strftime("%Y.%m.%d")),
@@ -817,7 +872,7 @@ if selected_tab == "실시간 모니터링":
 
         # --- [신규] 금일 운영 요약 창 띄우기 버튼 ---
         if st.button("📋 대기/폐수 금일 운영 요약 창 띄우기", use_container_width=True, type="primary"):
-            show_today_summary_dialog(df_today, sum_today, target_date_prev1.strftime("%Y.%m.%d"))
+            show_today_summary_dialog(df_today, sum_today, eh_today, target_date_prev1.strftime("%Y.%m.%d"))
 
         # --- [신규] 위드인천에너지 NOx 농도 알림 ---
         if isinstance(test_nox_value, dict) and 'value' in test_nox_value:
@@ -1021,11 +1076,11 @@ if selected_tab == "실시간 모니터링":
 
 if selected_tab == "기간별 운영 현황":
     # 상단에서 설정된 전역 조회 기준(global_params)으로 데이터 로드
-    df, summary_data, end_date = load_data(**global_params)
+    df, summary_data, external_heat_data, end_date = load_data(**global_params)
 
     if selected_sub_tab == "📈 대기배출시설 현황":
         # 5. 스타일 및 테이블 표시
-        st.markdown(f"<h3 style='margin-top: -80px; margin-bottom: 15px;'>대기배출시설 및 방지시설 운영 현황 ({period_string})</h3>", unsafe_allow_html=True)
+        st.markdown(f"<h3 style='margin-top: -15px; margin-bottom: 15px;'>대기배출시설 및 방지시설 운영 현황 ({period_string})</h3>", unsafe_allow_html=True)
         
         # --- 가동 중인 설비에 네온 효과를 주기 위한 동적 CSS 생성 ---
         glow_style_css = ""
@@ -1144,6 +1199,37 @@ if selected_tab == "기간별 운영 현황":
                     
                     st.metric(label=f"사용량 ({details['unit']})", value=display_val)
 
+    elif selected_sub_tab == "♨️ 외부수열 현황":
+        st.markdown(f"<h3 style='margin-top: -15px; margin-bottom: 15px;'>외부수열 운영 현황 ({period_string})</h3>", unsafe_allow_html=True)
+
+        # --- 카드 스타일 조정 (대기배출시설과 유사하게) ---
+        static_css = """
+        <style>
+            div[data-testid="stMetric"] {
+                margin-bottom: -15px !important;
+            }
+            [data-testid="stMetric"] label {
+                color: #aaaaaa;
+            }
+            [data-testid="stMetric"] [data-testid="stMetricValue"] {
+                font-size: 1.7rem !important;
+                font-weight: 600 !important;
+            }
+        </style>
+        """
+        st.markdown(static_css, unsafe_allow_html=True)
+
+        cols = st.columns(len(external_heat_data)) # Create columns based on number of facilities
+        
+        if external_heat_data:
+            for i, (facility_name, heat_value) in enumerate(external_heat_data.items()):
+                with cols[i]:
+                    with st.container(border=True):
+                        st.markdown(f"<div style='text-align: center; font-weight: 700; font-size: 1.2rem; margin-bottom: 15px;'>♨️ {facility_name}</div>", unsafe_allow_html=True)
+                        st.metric(label="수열량 (Gcal)", value=f"{heat_value:,.1f}")
+        else:
+            st.warning("외부수열 데이터를 불러올 수 없거나 데이터가 비어있습니다.")
+
     # --- 7. 월별/연별 운영 실적 추이 그래프 ---
     st.markdown("---")
     st.markdown("### 📊 월별/연별 운영 실적 추이 그래프")
@@ -1153,10 +1239,10 @@ if selected_tab == "기간별 운영 현황":
         analysis_target = "대기배출시설"
     elif "폐수배출시설" in selected_sub_tab:
         analysis_target = "폐수배출시설"
+    elif "외부수열" in selected_sub_tab:
+        analysis_target = "외부수열"
     else:
         analysis_target = "대기배출시설" # 기본값
-
-    comp_type = st.radio("분석 모드", ["기간별 추이", "비교 분석"], horizontal=True, key="comp_type_radio")
 
     kst_now = datetime.now(ZoneInfo('Asia/Seoul'))
     current_year = kst_now.year
@@ -1165,348 +1251,761 @@ if selected_tab == "기간별 운영 현황":
     chart_color = ["#1f77b4", "#ff4b4b"]
     chart_color = ["#17A589", "#ff4b4b"]
 
-    if comp_type == "기간별 추이":
-        trend_df = pd.DataFrame()
-        data_list = []
-        labels = []
+    # 외부수열을 포함한 모든 탭에서 분석 모드 라디오 버튼 표시
+    if True:
+        comp_type = st.radio("분석 모드", ["기간별 추이", "비교 분석"], horizontal=True, key="comp_type_radio")
 
-        # --- 1. Controls ---
-        control_col, _ = st.columns(2)
-        with control_col:
-            sub_type = st.radio("조회 기준", ["월별", "연도별"], horizontal=True, key="sub_type_radio")
+        if comp_type == "기간별 추이":
+            trend_df = pd.DataFrame()
+            data_list = []
+            labels = []
 
+            # --- 1. Controls ---
+            control_col, _ = st.columns(2)
+            with control_col:
+                sub_type = st.radio("그래프 조회 단위", ["월별", "연도별"], horizontal=True, key="sub_type_radio")
+
+                if sub_type == "연도별":
+                    yc1, yc2 = st.columns(2)
+                    with yc1:
+                        trend_start_year = st.selectbox("시작 연도", years, key="ts_y_yr")
+                    with yc2:
+                        trend_end_year = st.selectbox("종료 연도", years, index=len(years)-1, key="te_y_yr")
+                else: # 월별
+                    mc1, mc2 = st.columns(2)
+                    with mc1:
+                        st.markdown("**시작 월**")
+                        sc1, sc2 = st.columns(2)
+                        with sc1:
+                            trend_start_year = st.selectbox("연도", years, key="ts_y_mo")
+                        with sc2:
+                            trend_start_month = st.selectbox("월", range(1, 13), key="ts_m_mo")
+                    with mc2:
+                        st.markdown("**종료 월**")
+                        ec1, ec2 = st.columns(2)
+                        with ec1:
+                            trend_end_year = st.selectbox("연도", years, index=len(years)-1, key="te_y_mo")
+                        with ec2:
+                            trend_end_month = st.selectbox("월", range(1, 13), index=kst_now.month-1, key="te_m_mo")
+
+            # --- 2. Data Loading ---
             if sub_type == "연도별":
-                yc1, yc2 = st.columns(2)
-                with yc1:
-                    trend_start_year = st.selectbox("시작 연도", years, key="ts_y_yr")
-                with yc2:
-                    trend_end_year = st.selectbox("종료 연도", years, index=len(years)-1, key="te_y_yr")
+                if trend_start_year <= trend_end_year:
+                    for y in range(trend_start_year, trend_end_year + 1):
+                        df_y, summary_y, external_heat_summary_y, _ = load_data('연별', year=y) # load_data 반환값 변경
+                        if analysis_target == "대기배출시설":
+                            y_df = df_y
+                            if not y_df.empty:
+                                heat = pd.to_numeric(y_df['열 생산량 (Gcal)'], errors='coerce').sum()
+                                lng = pd.to_numeric(y_df['LNG 사용량 (m³)'], errors='coerce').sum()
+                                ghg = pd.to_numeric(y_df['온실가스 배출량 (tCO₂)'], errors='coerce').sum()
+                                labels.append(f"{y}년")
+                                data_list.append({'열 생산량 (Gcal)': heat, 'LNG 사용량 (m³)': lng, '온실가스 배출량 (tCO₂)': ghg})
+                        elif analysis_target == "폐수배출시설": # 폐수배출시설
+                            summary = summary_y
+                            if summary and any(summary.values()): # summary_y 사용
+                                labels.append(f"{y}년")
+                                data_list.append(summary)
+                        elif analysis_target == "외부수열": # 외부수열
+                            eh_summary = external_heat_summary_y
+                            if eh_summary and any(eh_summary.values()):
+                                labels.append(f"{y}년")
+                                data_list.append(eh_summary)
+                else:
+                    st.warning("시작 연도가 종료 연도보다 늦습니다.")
+
             else: # 월별
-                mc1, mc2 = st.columns(2)
-                with mc1:
-                    st.markdown("**시작 월**")
-                    sc1, sc2 = st.columns(2)
-                    with sc1:
-                        trend_start_year = st.selectbox("연도", years, key="ts_y_mo")
-                    with sc2:
-                        trend_start_month = st.selectbox("월", range(1, 13), key="ts_m_mo")
-                with mc2:
-                    st.markdown("**종료 월**")
-                    ec1, ec2 = st.columns(2)
-                    with ec1:
-                        trend_end_year = st.selectbox("연도", years, index=len(years)-1, key="te_y_mo")
-                    with ec2:
-                        trend_end_month = st.selectbox("월", range(1, 13), index=kst_now.month-1, key="te_m_mo")
+                if trend_start_year < trend_end_year or (trend_start_year == trend_end_year and trend_start_month <= trend_end_month):
+                    current_y, current_m = trend_start_year, trend_start_month
+                    while (current_y < trend_end_year) or (current_y == trend_end_year and current_m <= trend_end_month):
+                        df_m, summary_m, external_heat_summary_m, _ = load_data('월별', year=current_y, month=current_m) # load_data 반환값 변경
+                        if analysis_target == "대기배출시설":
+                            m_df = df_m
+                            if not m_df.empty: # m_df 사용
+                                heat = pd.to_numeric(m_df['열 생산량 (Gcal)'], errors='coerce').sum()
+                                lng = pd.to_numeric(m_df['LNG 사용량 (m³)'], errors='coerce').sum()
+                                ghg = pd.to_numeric(m_df['온실가스 배출량 (tCO₂)'], errors='coerce').sum()
+                                labels.append(f"{current_y}년 {current_m}월")
+                                data_list.append({'열 생산량 (Gcal)': heat, 'LNG 사용량 (m³)': lng, '온실가스 배출량 (tCO₂)': ghg})
+                        elif analysis_target == "폐수배출시설": # 폐수배출시설
+                            summary = summary_m
+                            if summary and any(summary.values()): # summary_m 사용
+                                labels.append(f"{current_y}년 {current_m}월")
+                                data_list.append(summary)
+                        elif analysis_target == "외부수열": # 외부수열
+                            eh_summary = external_heat_summary_m
+                            if eh_summary and any(eh_summary.values()):
+                                labels.append(f"{current_y}년 {current_m}월")
+                                data_list.append(eh_summary)
+                        current_m += 1
+                        if current_m > 12:
+                            current_m = 1
+                            current_y += 1
+                else:
+                    st.warning("시작 월이 종료 월보다 늦습니다.")
 
-        # --- 2. Data Loading ---
-        if sub_type == "연도별":
-            if trend_start_year <= trend_end_year:
-                for y in range(trend_start_year, trend_end_year + 1):
-                    if analysis_target == "대기배출시설":
-                        y_df, _, _ = load_data('연별', year=y)
-                        if not y_df.empty:
-                            heat = pd.to_numeric(y_df['열 생산량 (Gcal)'], errors='coerce').sum()
-                            lng = pd.to_numeric(y_df['LNG 사용량 (m³)'], errors='coerce').sum()
-                            ghg = pd.to_numeric(y_df['온실가스 배출량 (tCO₂)'], errors='coerce').sum()
-                            labels.append(f"{y}년")
-                            data_list.append({'열 생산량 (Gcal)': heat, 'LNG 사용량 (m³)': lng, '온실가스 배출량 (tCO₂)': ghg})
-                    else: # 폐수배출시설
-                        _, summary, _ = load_data('연별', year=y)
-                        if summary and any(summary.values()):
-                            labels.append(f"{y}년")
-                            data_list.append(summary)
+            if data_list:
+                trend_df = pd.DataFrame(data_list, index=labels)
+                trend_df.index = pd.Categorical(trend_df.index, categories=labels, ordered=True)
+                trend_df.index.name = "기간"
+
+            if not trend_df.empty:
+                chart_col, table_col = st.columns([1.2, 0.8])
+
+                with chart_col:
+                    if analysis_target == "대기배출시설": # 대기배출시설 추이 그래프
+                        trend_metric = st.segmented_control(
+                            "그래프 지표 선택",
+                            ['열 생산량 (Gcal)', 'LNG 사용량 (m³)', '온실가스 배출량 (tCO₂)'],
+                            default='열 생산량 (Gcal)',
+                            selection_mode="single",
+                            key="trend_metric_select"
+                        )
+                        if not trend_metric: trend_metric = '열 생산량 (Gcal)'
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        categories = list(trend_df.index)
+                        data_values = [float(v) if pd.notna(v) else 0.0 for v in trend_df[trend_metric]]
+
+                        # ECharts data with custom colors
+                        echarts_data_items = []
+                        for category, value in zip(categories, data_values):
+                            if '2026' in category: # 2026년 데이터에 다른 색상 적용
+                                color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                    { offset: 0, color: '#FF416C' },
+                                    { offset: 1, color: '#FF4B2B' }
+                                ])"""
+                            else:
+                                color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                    { offset: 0, color: '#36D1DC' },
+                                    { offset: 1, color: '#5B86E5' }
+                                ])"""
+
+                            item_str = f"""{{
+                                value: {value},
+                                itemStyle: {{
+                                    color: {color_js},
+                                    borderRadius: [6, 6, 0, 0],
+                                    shadowColor: 'rgba(0, 0, 0, 0.1)',
+                                    shadowBlur: 10,
+                                    shadowOffsetX: 0,
+                                    shadowOffsetY: 5
+                                }}
+                            }}"""
+                            echarts_data_items.append(item_str)
+
+                        echarts_data_str = f"[{', '.join(echarts_data_items)}]"
+
+                        html_code = f"""
+                            <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+                            <div id="chart-container-trend" style="height: 400px; width: 100%;"></div>
+                            <script>
+                            var chartDom = document.getElementById('chart-container-trend');
+                            var myChart = echarts.init(chartDom);
+                            var option = {{
+                                tooltip: {{ // 툴팁 디자인 개선
+                                    trigger: 'axis',
+                                    axisPointer: {{ type: 'shadow', shadowStyle: {{ color: 'rgba(0, 0, 0, 0.05)' }} }},
+                                    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                                    borderColor: '#edf2f7',
+                                    borderWidth: 1,
+                                    padding: [10, 15],
+                                    textStyle: {{ color: '#2d3748', fontSize: 13 }},
+                                    valueFormatter: (value) => parseFloat(value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}})
+                                }},
+                                legend: {{ data: ['{trend_metric}'], bottom: 0, icon: 'circle', textStyle: {{ color: '#4a5568', fontWeight: '600', fontSize: 13 }} }},
+                                grid: {{ left: '3%', right: '4%', bottom: '12%', top: '15%', containLabel: true }},
+                                xAxis: [{{ // X축 디자인 개선
+                                    type: 'category',
+                                    data: {categories},
+                                    axisLine: {{ show: false }},
+                                    axisTick: {{ show: false }},
+                                    axisLabel: {{ color: '#718096', margin: 12, fontWeight: '500' }}
+                                }}],
+                                yAxis: [{{ // Y축 디자인 개선
+                                    type: 'value',
+                                    name: '{trend_metric}',
+                                    nameTextStyle: {{ color: '#718096', padding: [0, 0, 0, 10], fontWeight: '500' }},
+                                    splitLine: {{ lineStyle: {{ type: 'dashed', color: '#e2e8f0' }} }},
+                                    axisLabel: {{ color: '#718096' }}
+                                }}],
+                                series: [
+                                    {{
+                                        name: '{trend_metric}',
+                                        type: 'bar',
+                                        barMaxWidth: 50, // 막대 최대 너비
+                                        data: {echarts_data_str}
+                                    }}
+                                ]
+                            }};
+                            myChart.setOption(option);
+                            window.addEventListener('resize', function() {{ myChart.resize(); }});
+                            </script>
+                        """
+                        components.html(html_code, height=450)
+                    elif analysis_target == "폐수배출시설": # 폐수배출시설 추이 그래프
+                        wastewater_items_cumulative = {
+                            "총 상수도 사용량": "m³", "순수 생산량": "m³", "방류수량": "m³",
+                            "폐수전력 사용량": "kWh", "생활용수량": "m³", "1차 냉각수량": "m³"
+                        }
+                        wastewater_metrics = list(wastewater_items_cumulative.keys())
+
+                        trend_metric_water = st.segmented_control(
+                            "그래프 지표 선택",
+                            wastewater_metrics,
+                            default=wastewater_metrics[0],
+                            selection_mode="single",
+                            key="trend_metric_select_water"
+                        )
+                        if not trend_metric_water: trend_metric_water = wastewater_metrics[0]
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        categories = list(trend_df.index)
+                        data_values = [float(v) if pd.notna(v) else 0.0 for v in trend_df[trend_metric_water]]
+
+                        # ECharts data with custom colors
+                        echarts_data_items = []
+                        for category, value in zip(categories, data_values):
+                            if '2026' in category: # 2026년 데이터에 다른 색상 적용
+                                color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                    { offset: 0, color: '#DA22FF' },
+                                    { offset: 1, color: '#9733EE' }
+                                ])"""
+                            else:
+                                color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                    { offset: 0, color: '#00b09b' },
+                                    { offset: 1, color: '#96c93d' }
+                                ])"""
+
+                            item_str = f"""{{
+                                value: {value},
+                                itemStyle: {{
+                                    color: {color_js},
+                                    borderRadius: [6, 6, 0, 0],
+                                    shadowColor: 'rgba(0, 0, 0, 0.1)',
+                                    shadowBlur: 10,
+                                    shadowOffsetX: 0,
+                                    shadowOffsetY: 5
+                                }}
+                            }}"""
+                            echarts_data_items.append(item_str)
+
+                        echarts_data_str = f"[{', '.join(echarts_data_items)}]"
+
+                        html_code = f"""
+                            <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+                            <div id="chart-container-trend-water" style="height: 400px; width: 100%;"></div>
+                            <script>
+                            var chartDom = document.getElementById('chart-container-trend-water');
+                            var myChart = echarts.init(chartDom);
+                            var option = {{
+                                tooltip: {{ // 툴팁 디자인 개선
+                                    trigger: 'axis',
+                                    axisPointer: {{ type: 'shadow', shadowStyle: {{ color: 'rgba(0, 0, 0, 0.05)' }} }},
+                                    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                                    borderColor: '#edf2f7',
+                                    borderWidth: 1,
+                                    padding: [10, 15],
+                                    textStyle: {{ color: '#2d3748', fontSize: 13 }},
+                                    valueFormatter: (value) => parseFloat(value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}})
+                                }},
+                                legend: {{ data: ['{trend_metric_water}'], bottom: 0, icon: 'circle', textStyle: {{ color: '#4a5568', fontWeight: '600', fontSize: 13 }} }},
+                                grid: {{ left: '3%', right: '4%', bottom: '12%', top: '15%', containLabel: true }},
+                                xAxis: [{{ // X축 디자인 개선
+                                    type: 'category',
+                                    data: {categories},
+                                    axisLine: {{ show: false }},
+                                    axisTick: {{ show: false }},
+                                    axisLabel: {{ color: '#718096', margin: 12, fontWeight: '500' }}
+                                }}],
+                                yAxis: [{{ // Y축 디자인 개선
+                                    type: 'value',
+                                    name: '{trend_metric_water}',
+                                    nameTextStyle: {{ color: '#718096', padding: [0, 0, 0, 10], fontWeight: '500' }},
+                                    splitLine: {{ lineStyle: {{ type: 'dashed', color: '#e2e8f0' }} }},
+                                    axisLabel: {{ color: '#718096' }}
+                                }}],
+                                series: [
+                                    {{
+                                        name: '{trend_metric_water}',
+                                        type: 'bar',
+                                        barMaxWidth: 50, // 막대 최대 너비
+                                        data: {echarts_data_str}
+                                    }}
+                                ]
+                            }};
+                            myChart.setOption(option);
+                            window.addEventListener('resize', function() {{ myChart.resize(); }});
+                            </script>
+                        """
+                        components.html(html_code, height=450)
+                    
+                    elif analysis_target == "외부수열": # 외부수열 누적 막대그래프
+                        all_facilities = ['남부소각장', 'ERG', 'SRF', '인천종합에너지', '안산도시개발']
+                        fac_colors = {
+                            '남부소각장': '#FF6B6B', 
+                            'ERG': '#4ECDC4', 
+                            'SRF': '#45B7D1', 
+                            '인천종합에너지': '#F7D794', 
+                            '안산도시개발': '#96CEB4'
+                        }
+                        
+                        selected_facs = st.segmented_control(
+                            "수열처 선택 (선택하지 않으면 전체 누적 표시)",
+                            all_facilities,
+                            default=[],
+                            selection_mode="multi",
+                            key="trend_fac_select_heat"
+                        )
+                        
+                        facilities_to_plot = selected_facs if selected_facs else all_facilities
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        categories = list(trend_df.index)
+                        
+                        series_data = []
+                        for fac in facilities_to_plot:
+                            if fac in trend_df.columns:
+                                data_values = [float(v) if pd.notna(v) else 0.0 for v in trend_df[fac]]
+                                series_data.append(f"""{{
+                                    name: '{fac}',
+                                    type: 'bar',
+                                    stack: 'total',
+                                    barMaxWidth: 50,
+                                    itemStyle: {{ color: '{fac_colors[fac]}' }},
+                                    data: {data_values}
+                                }}""")
+                        series_str = ",\n".join(series_data)
+                        
+                        html_code = f"""
+                            <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+                            <div id="chart-container-trend-heat" style="height: 400px; width: 100%;"></div>
+                            <script>
+                            var chartDom = document.getElementById('chart-container-trend-heat');
+                            var myChart = echarts.init(chartDom);
+                            var option = {{
+                                tooltip: {{
+                                    trigger: 'axis',
+                                    axisPointer: {{ type: 'shadow' }},
+                                    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                                    borderColor: '#edf2f7',
+                                    borderWidth: 1,
+                                    padding: [10, 15],
+                                    textStyle: {{ color: '#2d3748', fontSize: 13 }},
+                                    valueFormatter: (value) => parseFloat(value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}}) + ' Gcal'
+                                }},
+                                legend: {{ data: {facilities_to_plot}, bottom: 0, icon: 'circle', textStyle: {{ color: '#4a5568', fontWeight: '600', fontSize: 13 }} }},
+                                grid: {{ left: '3%', right: '4%', bottom: '12%', top: '15%', containLabel: true }},
+                                xAxis: [{{
+                                    type: 'category',
+                                    data: {categories},
+                                    axisLine: {{ show: false }},
+                                    axisTick: {{ show: false }},
+                                    axisLabel: {{ color: '#718096', margin: 12, fontWeight: '500' }}
+                                }}],
+                                yAxis: [{{
+                                    type: 'value',
+                                    name: '수열량 (Gcal)',
+                                    nameTextStyle: {{ color: '#718096', padding: [0, 0, 0, 10], fontWeight: '500' }},
+                                    splitLine: {{ lineStyle: {{ type: 'dashed', color: '#e2e8f0' }} }},
+                                    axisLabel: {{ color: '#718096' }}
+                                }}],
+                                series: [{series_str}]
+                            }};
+                            myChart.setOption(option);
+                            window.addEventListener('resize', function() {{ myChart.resize(); }});
+                            </script>
+                        """
+                        components.html(html_code, height=450)
+
+                with table_col:
+                    st.markdown("#### 📋 운영 실적 데이터")
+                    st.dataframe(trend_df.style.format("{:,.1f}", na_rep="-"), use_container_width=True)
+
             else:
-                st.warning("시작 연도가 종료 연도보다 늦습니다.")
+                st.info("선택한 기간에 해당하는 데이터가 없습니다.")
 
-        else: # 월별
-            if trend_start_year < trend_end_year or (trend_start_year == trend_end_year and trend_start_month <= trend_end_month):
-                current_y, current_m = trend_start_year, trend_start_month
-                while (current_y < trend_end_year) or (current_y == trend_end_year and current_m <= trend_end_month):
-                    if analysis_target == "대기배출시설":
-                        m_df, _, _ = load_data('월별', year=current_y, month=current_m)
+        elif comp_type == "비교 분석":
+            if analysis_target == "대기배출시설":
+                trend_metric = st.segmented_control(
+                    "그래프 지표 선택",
+                    ['열 생산량 (Gcal)', 'LNG 사용량 (m³)', '온실가스 배출량 (tCO₂)'],
+                    default='열 생산량 (Gcal)',
+                    selection_mode="single",
+                    key="comp_metric_select"
+                )
+                if not trend_metric: trend_metric = '열 생산량 (Gcal)'
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                
+                # --- 연도별 비교 ---
+                st.markdown("#### 📅 연도별 비교")
+                c1, c2 = st.columns(2)
+                with c1:
+                    year1 = st.selectbox("비교 연도 1 (파란색)", years, key="comp_y1")
+                with c2:
+                    year2 = st.selectbox("비교 연도 2 (빨간색)", years, index=len(years)-1 if len(years)>1 else 0, key="comp_y2")
+                    
+                yearly_dict = {}
+                for m in range(1, 13):
+                    row_data = {}
+                    for y, label in [(year1, f"{year1}년"), (year2, f"{year2}년")]:
+                        m_df, _, _, _ = load_data('월별', year=y, month=m) # load_data 반환값 변경
                         if not m_df.empty:
                             heat = pd.to_numeric(m_df['열 생산량 (Gcal)'], errors='coerce').sum()
                             lng = pd.to_numeric(m_df['LNG 사용량 (m³)'], errors='coerce').sum()
                             ghg = pd.to_numeric(m_df['온실가스 배출량 (tCO₂)'], errors='coerce').sum()
-                            labels.append(f"{current_y}년 {current_m}월")
-                            data_list.append({'열 생산량 (Gcal)': heat, 'LNG 사용량 (m³)': lng, '온실가스 배출량 (tCO₂)': ghg})
-                    else: # 폐수배출시설
-                        _, summary, _ = load_data('월별', year=current_y, month=current_m)
-                        if summary and any(summary.values()):
-                            labels.append(f"{current_y}년 {current_m}월")
-                            data_list.append(summary)
-                    current_m += 1
-                    if current_m > 12:
-                        current_m = 1
-                        current_y += 1
-            else:
-                st.warning("시작 월이 종료 월보다 늦습니다.")
-
-        if data_list:
-            trend_df = pd.DataFrame(data_list, index=labels)
-            trend_df.index = pd.Categorical(trend_df.index, categories=labels, ordered=True)
-            trend_df.index.name = "기간"
-
-        if not trend_df.empty:
-            chart_col, table_col = st.columns([1.2, 0.8])
-
-            with chart_col:
-                if analysis_target == "대기배출시설":
-                    trend_metric = st.segmented_control(
-                        "그래프 지표 선택",
-                        ['열 생산량 (Gcal)', 'LNG 사용량 (m³)', '온실가스 배출량 (tCO₂)'],
-                        default='열 생산량 (Gcal)',
-                        selection_mode="single",
-                        key="trend_metric_select"
-                    )
-                    if not trend_metric: trend_metric = '열 생산량 (Gcal)'
-
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    categories = list(trend_df.index)
-                    data_values = [float(v) if pd.notna(v) else 0.0 for v in trend_df[trend_metric]]
-
-                    # ECharts data with custom colors
-                    echarts_data_items = []
-                    for category, value in zip(categories, data_values):
-                        if category == '2026년':
-                            color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                { offset: 0, color: '#ff758c' },
-                                { offset: 1, color: '#ff7eb3' }
-                            ])"""
+                            row_data[f"{label} 열 생산량 (Gcal)"] = heat
+                            row_data[f"{label} LNG 사용량 (m³)"] = lng
+                            row_data[f"{label} 온실가스 배출량 (tCO₂)"] = ghg
                         else:
-                            color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                { offset: 0, color: '#1ABC9C' },
-                                { offset: 1, color: '#117A65' }
-                            ])"""
-
-                        item_str = f"""{{
-                            value: {value},
-                            itemStyle: {{
-                                color: {color_js},
-                                borderRadius: [5, 5, 0, 0],
-                                shadowColor: 'rgba(0, 0, 0, 0.4)',
-                                shadowBlur: 8,
-                                shadowOffsetX: 3,
-                                shadowOffsetY: 3
-                            }}
-                        }}"""
-                        echarts_data_items.append(item_str)
-
-                    echarts_data_str = f"[{', '.join(echarts_data_items)}]"
-
+                            row_data[f"{label} 열 생산량 (Gcal)"] = 0.0
+                            row_data[f"{label} LNG 사용량 (m³)"] = 0.0
+                            row_data[f"{label} 온실가스 배출량 (tCO₂)"] = 0.0
+                    yearly_dict[f"{m}월"] = row_data
+                
+                if yearly_dict:
+                    yearly_df = pd.DataFrame.from_dict(yearly_dict, orient='index')
+                    yearly_df.index = pd.Categorical(yearly_df.index, categories=list(yearly_dict.keys()), ordered=True)
+                    
+                    cols_to_plot = [f"{year1}년 {trend_metric}", f"{year2}년 {trend_metric}"]
+                    # --- ECharts를 이용한 3D 느낌의 막대 그래프 렌더링 ---
+                    y1_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df[cols_to_plot[0]]]
+                    y2_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df[cols_to_plot[1]]]
+                    categories = list(yearly_df.index)
+                    
                     html_code = f"""
                         <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-                        <div id="chart-container-trend" style="height: 400px; width: 100%;"></div>
+                        <div id="chart-container" style="height: 400px; width: 100%;"></div>
                         <script>
-                        var chartDom = document.getElementById('chart-container-trend');
+                        var chartDom = document.getElementById('chart-container');
                         var myChart = echarts.init(chartDom);
                         var option = {{
-                            tooltip: {{
+                            tooltip: {{ // 툴팁 디자인 개선
                                 trigger: 'axis',
-                                axisPointer: {{ type: 'shadow' }},
-                                valueFormatter: (value) => parseFloat(value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}})
+                                axisPointer: {{ type: 'shadow', shadowStyle: {{ color: 'rgba(0, 0, 0, 0.05)' }} }},
+                                backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                                borderColor: '#edf2f7',
+                                borderWidth: 1,
+                                padding: [10, 15],
+                                textStyle: {{ color: '#2d3748', fontSize: 13 }},
+                                formatter: function (params) {{
+                                    let result = '<div style="font-weight:bold; margin-bottom:5px; padding-bottom:5px; border-bottom:1px solid #edf2f7;">' + params[0].name + '</div>';
+                                    params.forEach(function (item) {{
+                                        result += '<div style="display:flex; justify-content:space-between; align-items:center; margin-top:3px;">' +
+                                                  '<span style="font-size:12px; color:#4a5568;">' + item.marker + item.seriesName + '&nbsp;&nbsp;</span>' + 
+                                                  '<span style="font-weight:600; color:#2d3748;">' + parseFloat(item.value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}}) + '</span>' +
+                                                  '</div>';
+                                    }});
+                                    return result;
+                                }}
                             }},
-                            legend: {{ data: ['{trend_metric}'], bottom: 0, textStyle: {{ color: '#333', fontWeight: 'bold', fontSize: 14 }} }},
-                            grid: {{ left: '3%', right: '4%', bottom: '15%', containLabel: true }},
-                            xAxis: [{{ type: 'category', data: {categories}, axisTick: {{ alignWithLabel: true }} }}],
-                            yAxis: [{{ type: 'value', name: '{trend_metric}' }}],
+                            legend: {{ data: ['{year1}년', '{year2}년'], bottom: 0, icon: 'circle', textStyle: {{ color: '#4a5568', fontWeight: '600', fontSize: 13 }} }},
+                            grid: {{ left: '3%', right: '4%', bottom: '12%', top: '15%', containLabel: true }},
+                            xAxis: [{{ // X축 디자인 개선
+                                type: 'category',
+                                data: {categories},
+                                axisLine: {{ show: false }},
+                                axisTick: {{ show: false }},
+                                axisLabel: {{ color: '#718096', margin: 12, fontWeight: '500' }}
+                            }}],
+                            yAxis: [{{ // Y축 디자인 개선
+                                type: 'value',
+                                name: '{trend_metric}',
+                                nameTextStyle: {{ color: '#718096', padding: [0, 0, 0, 10], fontWeight: '500' }},
+                                splitLine: {{ lineStyle: {{ type: 'dashed', color: '#e2e8f0' }} }},
+                                axisLabel: {{ color: '#718096' }}
+                            }}],
                             series: [
                                 {{
-                                    name: '{trend_metric}',
+                                    name: '{year1}년',
                                     type: 'bar',
-                                    data: {echarts_data_str}
+                                    barGap: '15%', // 막대 간격 조정
+                                    barMaxWidth: 40, // 막대 최대 너비
+                                    itemStyle: {{
+                                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                            {{ offset: 0, color: '#36D1DC' }},
+                                            {{ offset: 1, color: '#5B86E5' }}
+                                        ]),
+                                        borderRadius: [6, 6, 0, 0],
+                                        shadowColor: 'rgba(91, 134, 229, 0.3)',
+                                        shadowBlur: 10,
+                                        shadowOffsetX: 0,
+                                        shadowOffsetY: 4
+                                    }},
+                                    data: {y1_data}
+                                }},
+                                {{
+                                    name: '{year2}년',
+                                    type: 'bar',
+                                    barMaxWidth: 40, // 막대 최대 너비
+                                    itemStyle: {{
+                                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                                            {{ offset: 0, color: '#FF416C' }},
+                                            {{ offset: 1, color: '#FF4B2B' }}
+                                        ]),
+                                        borderRadius: [6, 6, 0, 0],
+                                        shadowColor: 'rgba(255, 75, 43, 0.3)',
+                                        shadowBlur: 10,
+                                        shadowOffsetX: 0,
+                                        shadowOffsetY: 4
+                                    }},
+                                    data: {y2_data}
                                 }}
                             ]
                         }};
                         myChart.setOption(option);
                         window.addEventListener('resize', function() {{ myChart.resize(); }});
-                        </script>
+                    </script>
                     """
                     components.html(html_code, height=450)
-                else: # 폐수배출시설
-                    wastewater_items_cumulative = {
-                        "총 상수도 사용량": "m³", "순수 생산량": "m³", "방류수량": "m³",
-                        "폐수전력 사용량": "kWh", "생활용수량": "m³", "1차 냉각수량": "m³"
-                    }
-                    wastewater_metrics = list(wastewater_items_cumulative.keys())
+                else:
+                    st.info("연도별 비교 데이터가 없습니다.")
 
-                    trend_metric_water = st.segmented_control(
-                        "그래프 지표 선택",
-                        wastewater_metrics,
-                        default=wastewater_metrics[0],
-                        selection_mode="single",
-                        key="trend_metric_select_water"
-                    )
-                    if not trend_metric_water: trend_metric_water = wastewater_metrics[0]
+            elif analysis_target == "외부수열":
+                all_facilities = ['남부소각장', 'ERG', 'SRF', '인천종합에너지', '안산도시개발']
+                
+                selected_facs_comp = st.segmented_control(
+                    "수열처 선택 (선택하지 않으면 전체 누적 표시)",
+                    all_facilities,
+                    default=[],
+                    selection_mode="multi",
+                    key="comp_fac_select_heat"
+                )
+                
+                facilities_to_plot = selected_facs_comp if selected_facs_comp else all_facilities
 
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    categories = list(trend_df.index)
-                    data_values = [float(v) if pd.notna(v) else 0.0 for v in trend_df[trend_metric_water]]
-
-                    # ECharts data with custom colors
-                    echarts_data_items = []
-                    for category, value in zip(categories, data_values):
-                        if category == '2026년':
-                            color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                { offset: 0, color: '#ff758c' },
-                                { offset: 1, color: '#ff7eb3' }
-                            ])"""
-                        else:
-                            color_js = """new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                { offset: 0, color: '#1ABC9C' },
-                                { offset: 1, color: '#117A65' }
-                            ])"""
-
-                        item_str = f"""{{
-                            value: {value},
-                            itemStyle: {{
-                                color: {color_js},
-                                borderRadius: [5, 5, 0, 0],
-                                shadowColor: 'rgba(0, 0, 0, 0.4)',
-                                shadowBlur: 8,
-                                shadowOffsetX: 3,
-                                shadowOffsetY: 3
-                            }}
-                        }}"""
-                        echarts_data_items.append(item_str)
-
-                    echarts_data_str = f"[{', '.join(echarts_data_items)}]"
-
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown("#### 📅 연도별 비교")
+                c1_h, c2_h = st.columns(2)
+                with c1_h:
+                    year1_h = st.selectbox("비교 연도 1 (파란색)", years, key="comp_y1_heat")
+                with c2_h:
+                    year2_h = st.selectbox("비교 연도 2 (빨간색)", years, index=len(years)-1 if len(years)>1 else 0, key="comp_y2_heat")
+                    
+                yearly_dict_heat = {}
+                for m in range(1, 13):
+                    row_data = {}
+                    for y, label in [(year1_h, f"{year1_h}년"), (year2_h, f"{year2_h}년")]:
+                        _, _, eh_summary, _ = load_data('월별', year=y, month=m)
+                        for fac in facilities_to_plot:
+                            val = eh_summary.get(fac, 0) if eh_summary else 0
+                            row_data[f"{label} {fac}"] = val
+                    yearly_dict_heat[f"{m}월"] = row_data
+                    
+                if yearly_dict_heat:
+                    yearly_df_heat = pd.DataFrame.from_dict(yearly_dict_heat, orient='index')
+                    categories = list(yearly_df_heat.index)
+                    
+                    colors_y1 = {'남부소각장': '#3498db', 'ERG': '#2980b9', 'SRF': '#1abc9c', '인천종합에너지': '#16a085', '안산도시개발': '#9b59b6'}
+                    colors_y2 = {'남부소각장': '#e74c3c', 'ERG': '#c0392b', 'SRF': '#e67e22', '인천종합에너지': '#d35400', '안산도시개발': '#f1c40f'}
+                    
+                    series_data = []
+                    legend_data = []
+                    for fac in facilities_to_plot:
+                        y1_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df_heat[f"{year1_h}년 {fac}"]]
+                        y2_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df_heat[f"{year2_h}년 {fac}"]]
+                        
+                        series_data.append(f"""{{
+                            name: '{fac} ({year1_h}년)',
+                            type: 'bar',
+                            stack: '{year1_h}년',
+                            barMaxWidth: 40,
+                            itemStyle: {{ color: '{colors_y1.get(fac, '#333')}' }},
+                            data: {y1_data}
+                        }}""")
+                        series_data.append(f"""{{
+                            name: '{fac} ({year2_h}년)',
+                            type: 'bar',
+                            stack: '{year2_h}년',
+                            barMaxWidth: 40,
+                            itemStyle: {{ color: '{colors_y2.get(fac, '#999')}' }},
+                            data: {y2_data}
+                        }}""")
+                        legend_data.append(f"'{fac} ({year1_h}년)'")
+                        legend_data.append(f"'{fac} ({year2_h}년)'")
+                        
+                    series_str = ",\n".join(series_data)
+                    legend_str = ",\n".join(legend_data)
+                    
                     html_code = f"""
-                        <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-                        <div id="chart-container-trend-water" style="height: 400px; width: 100%;"></div>
-                        <script>
-                        var chartDom = document.getElementById('chart-container-trend-water');
-                        var myChart = echarts.init(chartDom);
-                        var option = {{
-                            tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
-                            legend: {{ data: ['{trend_metric_water}'], bottom: 0, textStyle: {{ color: '#333', fontWeight: 'bold', fontSize: 14 }} }},
-                            grid: {{ left: '3%', right: '4%', bottom: '15%', containLabel: true }},
-                            xAxis: [{{ type: 'category', data: {categories}, axisTick: {{ alignWithLabel: true }} }}],
-                            yAxis: [{{ type: 'value', name: '{trend_metric_water}' }}],
-                            series: [
-                                {{
-                                    name: '{trend_metric_water}',
-                                    type: 'bar',
-                                    data: {echarts_data_str}
-                                }}
-                            ]
-                        }};
-                        myChart.setOption(option);
-                        window.addEventListener('resize', function() {{ myChart.resize(); }});
-                        </script>
-                    """
-                    components.html(html_code, height=450)
-
-            with table_col:
-                st.markdown("#### 📋 운영 실적 데이터")
-                st.dataframe(trend_df.style.format("{:,.1f}", na_rep="-"), use_container_width=True)
-
-        else:
-            st.info("선택한 기간에 해당하는 데이터가 없습니다.")
-
-    elif comp_type == "비교 분석":
-        if analysis_target == "대기배출시설":
-            trend_metric = st.segmented_control(
-                "그래프 지표 선택",
-                ['열 생산량 (Gcal)', 'LNG 사용량 (m³)', '온실가스 배출량 (tCO₂)'],
-                default='열 생산량 (Gcal)',
-                selection_mode="single",
-                key="comp_metric_select"
-            )
-            if not trend_metric: trend_metric = '열 생산량 (Gcal)'
-            
-            st.markdown("<br>", unsafe_allow_html=True)
-            
-            # --- 연도별 비교 ---
-            st.markdown("#### 📅 연도별 비교")
-            c1, c2 = st.columns(2)
-            with c1:
-                year1 = st.selectbox("비교 연도 1 (파란색)", years, key="comp_y1")
-            with c2:
-                year2 = st.selectbox("비교 연도 2 (빨간색)", years, index=len(years)-1 if len(years)>1 else 0, key="comp_y2")
-                
-            yearly_dict = {}
-            for m in range(1, 13):
-                row_data = {}
-                for y, label in [(year1, f"{year1}년"), (year2, f"{year2}년")]:
-                    m_df, _, _ = load_data('월별', year=y, month=m)
-                    if not m_df.empty:
-                        heat = pd.to_numeric(m_df['열 생산량 (Gcal)'], errors='coerce').sum()
-                        lng = pd.to_numeric(m_df['LNG 사용량 (m³)'], errors='coerce').sum()
-                        ghg = pd.to_numeric(m_df['온실가스 배출량 (tCO₂)'], errors='coerce').sum()
-                        row_data[f"{label} 열 생산량 (Gcal)"] = heat
-                        row_data[f"{label} LNG 사용량 (m³)"] = lng
-                        row_data[f"{label} 온실가스 배출량 (tCO₂)"] = ghg
-                    else:
-                        row_data[f"{label} 열 생산량 (Gcal)"] = 0.0
-                        row_data[f"{label} LNG 사용량 (m³)"] = 0.0
-                        row_data[f"{label} 온실가스 배출량 (tCO₂)"] = 0.0
-                yearly_dict[f"{m}월"] = row_data
-                
-            if yearly_dict:
-                yearly_df = pd.DataFrame.from_dict(yearly_dict, orient='index')
-                yearly_df.index = pd.Categorical(yearly_df.index, categories=list(yearly_dict.keys()), ordered=True)
-                
-                cols_to_plot = [f"{year1}년 {trend_metric}", f"{year2}년 {trend_metric}"]
-                # --- ECharts를 이용한 3D 느낌의 막대 그래프 렌더링 ---
-                y1_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df[cols_to_plot[0]]]
-                y2_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df[cols_to_plot[1]]]
-                categories = list(yearly_df.index)
-                
-                html_code = f"""
                     <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-                    <div id="chart-container" style="height: 400px; width: 100%;"></div>
+                    <div id="chart-container-heat-comp" style="height: 400px; width: 100%;"></div>
                     <script>
-                    var chartDom = document.getElementById('chart-container');
+                    var chartDom = document.getElementById('chart-container-heat-comp');
                     var myChart = echarts.init(chartDom);
                     var option = {{
                         tooltip: {{
                             trigger: 'axis',
-                            axisPointer: {{ type: 'shadow' }},
+                            axisPointer: {{ type: 'shadow', shadowStyle: {{ color: 'rgba(0, 0, 0, 0.05)' }} }},
+                            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                            borderColor: '#edf2f7',
+                            borderWidth: 1,
+                            padding: [10, 15],
+                            textStyle: {{ color: '#2d3748', fontSize: 13 }},
                             formatter: function (params) {{
-                                let result = params[0].name;
+                                let result = '<div style="font-weight:bold; margin-bottom:5px; padding-bottom:5px; border-bottom:1px solid #edf2f7;">' + params[0].name + '</div>';
                                 params.forEach(function (item) {{
-                                    result += '<br/>' + item.marker + ' ' + item.seriesName + ': ' + parseFloat(item.value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}});
+                                    if(parseFloat(item.value) > 0) {{
+                                        result += '<div style="display:flex; justify-content:space-between; align-items:center; margin-top:3px;">' +
+                                                  '<span style="font-size:12px; color:#4a5568;">' + item.marker + item.seriesName + '&nbsp;&nbsp;</span>' + 
+                                                  '<span style="font-weight:600; color:#2d3748;">' + parseFloat(item.value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}}) + '</span>' +
+                                                  '</div>';
+                                    }}
                                 }});
                                 return result;
                             }}
                         }},
-                        legend: {{ data: ['{year1}년', '{year2}년'], bottom: 0, textStyle: {{ color: '#333', fontWeight: 'bold', fontSize: 14 }} }},
-                        grid: {{ left: '3%', right: '4%', bottom: '15%', containLabel: true }},
-                        xAxis: [{{ type: 'category', data: {categories}, axisTick: {{ alignWithLabel: true }} }}],
-                        yAxis: [{{ type: 'value', name: '{trend_metric}' }}],
+                        legend: {{ 
+                            data: [{legend_str}], 
+                            bottom: 0, 
+                            type: 'scroll',
+                            icon: 'circle', 
+                            textStyle: {{ color: '#4a5568', fontWeight: '600', fontSize: 11 }} 
+                        }},
+                        grid: {{ left: '3%', right: '4%', bottom: '15%', top: '15%', containLabel: true }},
+                        xAxis: [{{ 
+                            type: 'category', 
+                            data: {categories}, 
+                            axisLine: {{ show: false }},
+                            axisTick: {{ show: false }},
+                            axisLabel: {{ color: '#718096', margin: 12, fontWeight: '500' }}
+                        }}],
+                        yAxis: [{{ 
+                            type: 'value', 
+                            name: '수열량 (Gcal)',
+                            nameTextStyle: {{ color: '#718096', padding: [0, 0, 0, 10], fontWeight: '500' }},
+                            splitLine: {{ lineStyle: {{ type: 'dashed', color: '#e2e8f0' }} }},
+                            axisLabel: {{ color: '#718096' }}
+                        }}],
+                        series: [{series_str}]
+                    }};
+                    myChart.setOption(option);
+                    window.addEventListener('resize', function() {{ myChart.resize(); }});
+                    </script>
+                    """
+                    components.html(html_code, height=450)
+                else:
+                    st.info("연도별 비교 데이터가 없습니다.")
+
+            elif analysis_target == "폐수배출시설":
+                wastewater_items_cumulative = {
+                    "총 상수도 사용량": "m³", "순수 생산량": "m³", "방류수량": "m³",
+                    "폐수전력 사용량": "kWh", "생활용수량": "m³", "1차 냉각수량": "m³"
+                }
+                wastewater_metrics = list(wastewater_items_cumulative.keys())
+                
+                trend_metric_water = st.segmented_control(
+                    "그래프 지표 선택", 
+                    wastewater_metrics, 
+                    default=wastewater_metrics[0], 
+                    selection_mode="single",
+                    key="comp_metric_select_water"
+                )
+                if not trend_metric_water: trend_metric_water = wastewater_metrics[0]
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # --- 연도별 비교 (폐수) ---
+                st.markdown("#### 📅 연도별 비교")
+                c1_w, c2_w = st.columns(2)
+                with c1_w:
+                    year1_w = st.selectbox("비교 연도 1 (녹색)", years, key="comp_y1_water")
+                with c2_w:
+                    year2_w = st.selectbox("비교 연도 2 (분홍색)", years, index=len(years)-1 if len(years)>1 else 0, key="comp_y2_water")
+                    
+                yearly_dict_water = {}
+                for m in range(1, 13):
+                    row_data = {}
+                    for y, label in [(year1_w, f"{year1_w}년"), (year2_w, f"{year2_w}년")]:
+                        _, summary, _, _ = load_data('월별', year=y, month=m) # load_data 반환값 변경
+                        val = summary.get(trend_metric_water, 0) if summary else 0
+                        row_data[f"{label} {trend_metric_water}"] = val
+                    yearly_dict_water[f"{m}월"] = row_data
+                    
+                if yearly_dict_water:
+                    yearly_df_water = pd.DataFrame.from_dict(yearly_dict_water, orient='index')
+                    
+                    cols_to_plot = [f"{year1_w}년 {trend_metric_water}", f"{year2_w}년 {trend_metric_water}"]
+                    y1_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df_water[cols_to_plot[0]]]
+                    y2_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df_water[cols_to_plot[1]]]
+                    categories = list(yearly_df_water.index)
+                    
+                    html_code = f"""
+                    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+                    <div id="chart-container-water" style="height: 400px; width: 100%;"></div>
+                    <script>
+                    var chartDom = document.getElementById('chart-container-water');
+                    var myChart = echarts.init(chartDom);
+                    var option = {{
+                        tooltip: {{
+                            trigger: 'axis',
+                            axisPointer: {{ type: 'shadow', shadowStyle: {{ color: 'rgba(0, 0, 0, 0.05)' }} }},
+                            backgroundColor: 'rgba(255, 255, 255, 0.95)',
+                            borderColor: '#edf2f7',
+                            borderWidth: 1,
+                            padding: [10, 15],
+                            textStyle: {{ color: '#2d3748', fontSize: 13 }},
+                            formatter: function (params) {{
+                                let result = '<div style="font-weight:bold; margin-bottom:5px; padding-bottom:5px; border-bottom:1px solid #edf2f7;">' + params[0].name + '</div>';
+                                params.forEach(function (item) {{
+                                    result += '<div style="display:flex; justify-content:space-between; align-items:center; margin-top:3px;">' +
+                                              '<span style="font-size:12px; color:#4a5568;">' + item.marker + item.seriesName + '&nbsp;&nbsp;</span>' + 
+                                              '<span style="font-weight:600; color:#2d3748;">' + parseFloat(item.value).toLocaleString(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1}}) + '</span>' +
+                                              '</div>';
+                                }});
+                                return result;
+                            }}
+                        }},
+                        legend: {{ data: ['{year1_w}년', '{year2_w}년'], bottom: 0, icon: 'circle', textStyle: {{ color: '#4a5568', fontWeight: '600', fontSize: 13 }} }},
+                        grid: {{ left: '3%', right: '4%', bottom: '12%', top: '15%', containLabel: true }},
+                        xAxis: [{{ 
+                            type: 'category', 
+                            data: {categories}, 
+                            axisLine: {{ show: false }},
+                            axisTick: {{ show: false }},
+                            axisLabel: {{ color: '#718096', margin: 12, fontWeight: '500' }}
+                        }}],
+                        yAxis: [{{ 
+                            type: 'value', 
+                            name: '{trend_metric_water}',
+                            nameTextStyle: {{ color: '#718096', padding: [0, 0, 0, 10], fontWeight: '500' }},
+                            splitLine: {{ lineStyle: {{ type: 'dashed', color: '#e2e8f0' }} }},
+                            axisLabel: {{ color: '#718096' }}
+                        }}],
                         series: [
                             {{
-                                name: '{year1}년',
+                                name: '{year1_w}년',
                                 type: 'bar',
-                                barGap: '10%',
+                                barGap: '15%',
+                                barMaxWidth: 40,
                                 itemStyle: {{
                                     color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                        {{ offset: 0, color: '#1ABC9C' }},
-                                        {{ offset: 1, color: '#117A65' }}
+                                        {{ offset: 0, color: '#00b09b' }},
+                                        {{ offset: 1, color: '#96c93d' }}
                                     ]),
-                                    borderRadius: [5, 5, 0, 0],
-                                    shadowColor: 'rgba(0, 0, 0, 0.4)',
-                                    shadowBlur: 8,
-                                    shadowOffsetX: 3,
-                                    shadowOffsetY: 3
+                                    borderRadius: [6, 6, 0, 0],
+                                    shadowColor: 'rgba(150, 201, 61, 0.3)',
+                                    shadowBlur: 10,
+                                    shadowOffsetX: 0,
+                                    shadowOffsetY: 4
                                 }},
                                 data: {y1_data}
                             }},
                             {{
-                                name: '{year2}년',
+                                name: '{year2_w}년',
                                 type: 'bar',
+                                barMaxWidth: 40,
                                 itemStyle: {{
                                     color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                        {{ offset: 0, color: '#ff758c' }},
-                                        {{ offset: 1, color: '#ff7eb3' }}
+                                        {{ offset: 0, color: '#DA22FF' }},
+                                        {{ offset: 1, color: '#9733EE' }}
                                     ]),
-                                    borderRadius: [5, 5, 0, 0],
-                                    shadowColor: 'rgba(0, 0, 0, 0.4)',
-                                    shadowBlur: 8,
-                                    shadowOffsetX: 3,
-                                    shadowOffsetY: 3
+                                    borderRadius: [6, 6, 0, 0],
+                                    shadowColor: 'rgba(151, 51, 238, 0.3)',
+                                    shadowBlur: 10,
+                                    shadowOffsetX: 0,
+                                    shadowOffsetY: 4
                                 }},
                                 data: {y2_data}
                             }}
@@ -1514,107 +2013,8 @@ if selected_tab == "기간별 운영 현황":
                     }};
                     myChart.setOption(option);
                     window.addEventListener('resize', function() {{ myChart.resize(); }});
-                </script>
-                """
-                components.html(html_code, height=450)
-            else:
-                st.info("연도별 비교 데이터가 없습니다.")
-
-        elif analysis_target == "폐수배출시설":
-            wastewater_items_cumulative = {
-                "총 상수도 사용량": "m³", "순수 생산량": "m³", "방류수량": "m³",
-                "폐수전력 사용량": "kWh", "생활용수량": "m³", "1차 냉각수량": "m³"
-            }
-            wastewater_metrics = list(wastewater_items_cumulative.keys())
-            
-            trend_metric_water = st.segmented_control(
-                "그래프 지표 선택", 
-                wastewater_metrics, 
-                default=wastewater_metrics[0], 
-                selection_mode="single",
-                key="comp_metric_select_water"
-            )
-            if not trend_metric_water: trend_metric_water = wastewater_metrics[0]
-            
-            st.markdown("<br>", unsafe_allow_html=True)
-
-            # --- 연도별 비교 (폐수) ---
-            st.markdown("#### 📅 연도별 비교")
-            c1_w, c2_w = st.columns(2)
-            with c1_w:
-                year1_w = st.selectbox("비교 연도 1 (녹색)", years, key="comp_y1_water")
-            with c2_w:
-                year2_w = st.selectbox("비교 연도 2 (분홍색)", years, index=len(years)-1 if len(years)>1 else 0, key="comp_y2_water")
-                
-            yearly_dict_water = {}
-            for m in range(1, 13):
-                row_data = {}
-                for y, label in [(year1_w, f"{year1_w}년"), (year2_w, f"{year2_w}년")]:
-                    _, summary, _ = load_data('월별', year=y, month=m)
-                    val = summary.get(trend_metric_water, 0) if summary else 0
-                    row_data[f"{label} {trend_metric_water}"] = val
-                yearly_dict_water[f"{m}월"] = row_data
-                
-            if yearly_dict_water:
-                yearly_df_water = pd.DataFrame.from_dict(yearly_dict_water, orient='index')
-                
-                cols_to_plot = [f"{year1_w}년 {trend_metric_water}", f"{year2_w}년 {trend_metric_water}"]
-                y1_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df_water[cols_to_plot[0]]]
-                y2_data = [float(v) if pd.notna(v) else 0.0 for v in yearly_df_water[cols_to_plot[1]]]
-                categories = list(yearly_df_water.index)
-                
-                html_code = f"""
-                <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-                <div id="chart-container-water" style="height: 400px; width: 100%;"></div>
-                <script>
-                var chartDom = document.getElementById('chart-container-water');
-                var myChart = echarts.init(chartDom);
-                var option = {{
-                    tooltip: {{ trigger: 'axis', axisPointer: {{ type: 'shadow' }} }},
-                    legend: {{ data: ['{year1_w}년', '{year2_w}년'], bottom: 0, textStyle: {{ color: '#333', fontWeight: 'bold', fontSize: 14 }} }},
-                    grid: {{ left: '3%', right: '4%', bottom: '15%', containLabel: true }},
-                    xAxis: [{{ type: 'category', data: {categories}, axisTick: {{ alignWithLabel: true }} }}],
-                    yAxis: [{{ type: 'value', name: '{trend_metric_water}' }}],
-                    series: [
-                        {{
-                            name: '{year1_w}년',
-                            type: 'bar',
-                            barGap: '10%',
-                            itemStyle: {{
-                                color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                    {{ offset: 0, color: '#1ABC9C' }},
-                                    {{ offset: 1, color: '#117A65' }}
-                                ]),
-                                borderRadius: [5, 5, 0, 0],
-                                shadowColor: 'rgba(0, 0, 0, 0.4)',
-                                shadowBlur: 8,
-                                shadowOffsetX: 3,
-                                shadowOffsetY: 3
-                            }},
-                            data: {y1_data}
-                        }},
-                        {{
-                            name: '{year2_w}년',
-                            type: 'bar',
-                            itemStyle: {{
-                                color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                    {{ offset: 0, color: '#ff758c' }},
-                                    {{ offset: 1, color: '#ff7eb3' }}
-                                ]),
-                                borderRadius: [5, 5, 0, 0],
-                                shadowColor: 'rgba(0, 0, 0, 0.4)',
-                                shadowBlur: 8,
-                                shadowOffsetX: 3,
-                                shadowOffsetY: 3
-                            }},
-                            data: {y2_data}
-                        }}
-                    ]
-                }};
-                myChart.setOption(option);
-                window.addEventListener('resize', function() {{ myChart.resize(); }});
-                </script>
-                """
-                components.html(html_code, height=450)
-            else:
-                st.info("연도별 비교 데이터가 없습니다.")
+                    </script>
+                    """
+                    components.html(html_code, height=450)
+                else:
+                    st.info("연도별 비교 데이터가 없습니다.")
