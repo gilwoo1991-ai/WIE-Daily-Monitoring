@@ -441,7 +441,8 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     # 파일 공유 설정을 "링크가 있는 모든 사용자 보기 가능"으로 한 후 파일 ID를 입력하세요.
     file_ids = {
         2025: "여기에_2025년_엑셀파일_ID를_넣어주세요",
-        2026: "여기에_2026년_엑셀파일_ID를_넣어주세요"
+        2025: "1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN",
+        2026: "1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq"
     }
 
     if query_year not in file_ids or "여기에" in file_ids[query_year]:
@@ -451,7 +452,8 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     # --- 2. 구글 드라이브 파일 읽기 ---
     try:
         file_id = file_ids[query_year]
-        url = f"https://drive.google.com/uc?id={file_id}&export=download"
+        # 구글 스프레드시트를 엑셀(.xlsx) 파일로 변환하여 다운로드
+        url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
         
         response = requests.get(url)
         response.raise_for_status()
