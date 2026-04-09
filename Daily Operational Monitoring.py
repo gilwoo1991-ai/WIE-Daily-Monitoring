@@ -496,6 +496,8 @@ def load_data(view_type, year=None, month=None, date_obj=None):
         # 2. 사용량 계산 (계량기 교체 및 리셋을 고려하여 일별 사용량 합산)
         def _calculate_cumulative_usage(prev_val, col_letter):
             col_idx = column_index_from_string(col_letter) - 1
+            if col_idx >= source_data_slice.shape[1]: # 열이 존재하지 않으면 0 반환
+                return 0.0
             s = pd.to_numeric(source_data_slice.iloc[:, col_idx], errors='coerce').dropna()
             
             total = 0
@@ -543,7 +545,10 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     try:
         for facility_name, col_letter in external_heat_cols.items():
             col_idx = column_index_from_string(col_letter) - 1
-            heat_value = pd.to_numeric(source_data_slice.iloc[:, col_idx], errors='coerce').sum()
+            if col_idx < source_data_slice.shape[1]:
+                heat_value = pd.to_numeric(source_data_slice.iloc[:, col_idx], errors='coerce').sum()
+            else:
+                heat_value = 0.0
             external_heat_summary[facility_name] = heat_value
     except Exception as e:
         st.warning(f"외부수열 관련 총량 데이터를 집계하는 중 오류 발생: {e}")
@@ -563,7 +568,10 @@ def load_data(view_type, year=None, month=None, date_obj=None):
         try:
             # AC열에서 해당 기간의 총 NOx 배출량 합산
             nox_col_idx = column_index_from_string('AC') - 1
-            total_nox_from_ac = pd.to_numeric(source_data_slice.iloc[:, nox_col_idx], errors='coerce').sum()
+            if nox_col_idx < source_data_slice.shape[1]:
+                total_nox_from_ac = pd.to_numeric(source_data_slice.iloc[:, nox_col_idx], errors='coerce').sum()
+            else:
+                total_nox_from_ac = 0.0
         except Exception as e:
             st.warning(f"{query_year}년 NOx 배출량 사전 집계 중 오류 발생: {e}")
             use_ac_col_for_nox = False # 오류 발생 시 기존 방식으로 계산하도록 플래그 변경
