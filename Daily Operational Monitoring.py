@@ -8,6 +8,7 @@ import requests
 from openpyxl.utils import column_index_from_string
 import os
 import io
+import time
 
 # 1. 페이지 설정 (넓은 화면 모드)
 st.set_page_config(
@@ -465,6 +466,23 @@ def load_data(view_type, year=None, month=None, date_obj=None):
         response = requests.get(url)
         response.raise_for_status()
         file_data = io.BytesIO(response.content)
+        # 다운로드 재시도 및 무결성 검증 로직 추가
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                
+                # HTML 페이지(예: 다운로드 권한 오류, 용량 초과 경고 등)가 응답으로 오지 않았는지 검증
+                if 'text/html' in response.headers.get('Content-Type', ''):
+                    raise ValueError("엑셀 파일이 아닌 HTML 페이지가 반환되었습니다.")
+                
+                file_data = io.BytesIO(response.content)
+                break # 다운로드 성공 시 루프 탈출
+            except (requests.exceptions.RequestException, ValueError) as e:
+                if attempt == max_retries - 1:
+                    raise e
+                time.sleep(2) # 2초 대기 후 재시도
 
         with pd.ExcelFile(file_data, engine='calamine') as xls:
             if query_year == 2026:
@@ -493,6 +511,19 @@ def load_data(view_type, year=None, month=None, date_obj=None):
                 daily_response = requests.get(daily_url)
                 daily_response.raise_for_status()
                 daily_file_data = io.BytesIO(daily_response.content)
+                
+                for attempt in range(max_retries):
+                    try:
+                        daily_response = requests.get(daily_url, timeout=30)
+                        daily_response.raise_for_status()
+                        if 'text/html' in daily_response.headers.get('Content-Type', ''):
+                            raise ValueError("엑셀 파일이 아닌 HTML 페이지가 반환되었습니다.")
+                        daily_file_data = io.BytesIO(daily_response.content)
+                        break
+                    except (requests.exceptions.RequestException, ValueError) as e:
+                        if attempt == max_retries - 1:
+                            raise e
+                        time.sleep(2)
             else:
                 daily_file_data = file_data # 같은 파일이면 재사용
 
