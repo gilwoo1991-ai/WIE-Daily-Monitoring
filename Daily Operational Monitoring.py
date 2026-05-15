@@ -440,9 +440,14 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     # --- 데이터 소스 설정 (구글 드라이브 직접 다운로드) ---
     # 파일 공유 설정을 "링크가 있는 모든 사용자 보기 가능"으로 한 후 파일 ID를 입력하세요.
     file_ids = {
-        2025: "여기에_2025년_엑셀파일_ID를_넣어주세요",
-        2025: "1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN",
-        2026: "1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq"
+        2025: "1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN", # 2025년 운영실적 파일
+        2026: "1jsiQw3WGLWrWEok67ZoZ0DY3TcAP-QAn"  # 2026년 위드운전실적(비번356)
+    }
+
+    # [신규] '일별' 데이터(CHP 가동시간)가 별도 파일에 있는 경우 파일 ID를 매핑합니다.
+    daily_file_ids = {
+        2025: "1PL50wVfvhf8UHuBEIqw3OEDqf2Lm0ljN", # 2025년은 기존 파일과 동일
+        2026: "1lS7Bf0sog_ZqcpMmOL7Ni0CPv0Yctisq"  # 환경 관련 가동현황(2026년) 파일 ID
     }
 
     if query_year not in file_ids or "여기에" in file_ids[query_year]:
@@ -451,60 +456,174 @@ def load_data(view_type, year=None, month=None, date_obj=None):
 
     # --- 2. 구글 드라이브 파일 읽기 ---
     try:
+        # --- 2-1. 주 데이터 파일 ('생산', '운전실적_원본', 폐수 등) 다운로드 ---
         file_id = file_ids[query_year]
-        # 구글 스프레드시트를 엑셀(.xlsx) 파일로 변환하여 다운로드
+        print(f"[{datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')}] Loading main data for year {query_year} from file ID: {file_id}")
+
         url = f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"
         
         response = requests.get(url)
         response.raise_for_status()
         file_data = io.BytesIO(response.content)
 
-        daily_sheet_df = pd.read_excel(file_data, sheet_name="일별", header=None, engine='openpyxl')
-        file_data.seek(0) # 버퍼 위치 초기화 후 두 번째 시트 읽기
-        source_sheet_df = pd.read_excel(file_data, sheet_name="운전실적_원본", header=None, engine='openpyxl')
+        with pd.ExcelFile(file_data, engine='calamine') as xls:
+            if query_year == 2026:
+                source_sheet_name = "생산"
+                source_sheet_df = pd.read_excel(xls, sheet_name=source_sheet_name, header=None)
+                try:
+                    wastewater_df = pd.read_excel(xls, sheet_name="key-in(LO)", header=None)
+                except ValueError: # 시트가 없을 경우
+                    st.warning("2026년 주 파일에서 'key-in(LO)' 시트를 찾을 수 없어 폐수 데이터를 집계할 수 없습니다.")
+                    wastewater_df = pd.DataFrame() # 빈 데이터프레임 할당
+            else:
+                source_sheet_name = "운전실적_원본"
+                source_sheet_df = pd.read_excel(xls, sheet_name=source_sheet_name, header=None)
+                wastewater_df = source_sheet_df
+
+        # --- 2-2. 일별 데이터 파일 (가동시간) 다운로드 ---
+        daily_file_id = daily_file_ids.get(query_year, file_id)
         
+        if "여기에" in daily_file_id:
+            st.warning(f"코드에 {query_year}년도 '환경 관련 가동현황' 파일 ID가 입력되지 않았습니다. 가동 시간 데이터를 주 파일의 '{source_sheet_name}' 시트에서 읽어옵니다.")
+            daily_sheet_df = source_sheet_df
+        else:
+            if daily_file_id != file_id:
+                print(f"[{datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')}] Loading daily data for year {query_year} from separate file ID: {daily_file_id}")
+                daily_url = f"https://docs.google.com/spreadsheets/d/{daily_file_id}/export?format=xlsx"
+                daily_response = requests.get(daily_url)
+                daily_response.raise_for_status()
+                daily_file_data = io.BytesIO(daily_response.content)
+            else:
+                daily_file_data = file_data # 같은 파일이면 재사용
+
+            with pd.ExcelFile(daily_file_data, engine='calamine') as daily_xls:
+                try:
+                    daily_sheet_df = pd.read_excel(daily_xls, sheet_name="일별", header=None)
+                except Exception as e:
+                    if "No sheet named" in str(e) or "Worksheet named" in str(e):
+                        if daily_file_id != file_id:
+                            st.warning(f"환경 관련 가동현황 파일에서 '일별' 시트를 찾을 수 없습니다. 가동 시간 데이터를 주 파일의 '{source_sheet_name}' 시트에서 읽어옵니다.")
+                        else:
+                            st.warning(f"{query_year}년 파일에서 '일별' 시트를 찾을 수 없습니다. 가동 시간 데이터를 '{source_sheet_name}' 시트에서 읽어옵니다.")
+                        daily_sheet_df = source_sheet_df # '일별' 시트가 없으면 주 데이터 시트를 가동시간 데이터로 사용
+                    else:
+                        raise e # 다른 종류의 오류는 다시 발생시킵니다.
+                
+                # [신규] 2026년 NOx 데이터를 위한 '운전실적_원본' 시트 추가 로드
+                if query_year == 2026:
+                    try:
+                        nox_sheet_df = pd.read_excel(daily_xls, sheet_name="운전실적_원본", header=None)
+                    except Exception as e:
+                        if "No sheet named" in str(e) or "Worksheet named" in str(e):
+                            st.warning("환경 관련 가동현황 파일에서 '운전실적_원본' 시트를 찾을 수 없습니다. NOx 데이터를 집계할 수 없습니다.")
+                            nox_sheet_df = pd.DataFrame()
+                        else:
+                            raise e
+
+    except requests.exceptions.HTTPError as e:
+        file_id = file_ids.get(query_year, "N/A")
+        if e.response.status_code == 401:
+            st.error(f"데이터 접근 권한 오류: {query_year}년 파일(ID: {file_id})에 접근할 수 없습니다. 구글 시트의 공유 설정이 '링크가 있는 모든 사용자'에게 '뷰어'로 공개되어 있는지 확인해주세요.")
+        else:
+            st.error(f"데이터 다운로드 중 HTTP 오류가 발생했습니다: {e}")
+        return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
     except Exception as e:
-        st.error(f"데이터 로딩 중 오류가 발생했습니다: {e}")
+        file_id = file_ids.get(query_year, "N/A")
+        if "No sheet named" in str(e):
+            source_sheet_name_for_error = "생산" if query_year == 2026 else "운전실적_원본"
+            st.error(f"시트 이름 오류: {query_year}년 파일(ID: {file_id})에서 필요한 시트를 찾을 수 없습니다. '일별' 시트와 '{source_sheet_name_for_error}' 시트가 모두 존재하는지 확인해주세요.")
+        else:
+            st.error(f"데이터 파일 처리 중 오류가 발생했습니다 (엔진: calamine): {e}")
+            st.info("파일 자체에 문제가 있을 수 있습니다. 구글 시트의 '데이터 > 이름이 지정된 범위' 메뉴를 확인하거나 파일의 사본을 만들어 다시 시도해 보세요.")
         return create_empty_df(), create_empty_summary_data(), create_empty_external_heat_data(), None
 
     # --- 3. 행 범위 계산 및 데이터 슬라이싱 ---
-    HEADER_OFFSET = 5
-    start_row_idx = start_date.timetuple().tm_yday + HEADER_OFFSET - 1
-    end_row_idx = end_date.timetuple().tm_yday + HEADER_OFFSET - 1
+    # 연도별로 데이터 시트의 시작 행(오프셋)이 다를 수 있습니다.
+    if query_year == 2026:
+        # 2026년 '생산' 탭: 1월 1일 데이터가 3행에 위치 (오프셋=2)
+        SOURCE_HEADER_OFFSET = 2
+        # 2026년 '일별' 탭: 1월 1일 데이터가 6행에 위치 (오프셋=5)
+        DAILY_HEADER_OFFSET = 5
+        # 2026년 '운전실적_원본' 탭: 1월 1일 데이터가 6행에 위치 (오프셋=5)
+        NOX_HEADER_OFFSET = 5
+    else:
+        # 2025년 및 기타: '운전실적_원본' 및 '일별' 탭 모두 6행부터 데이터 시작 (오프셋=5)
+        SOURCE_HEADER_OFFSET = 5
+        DAILY_HEADER_OFFSET = 5
+        NOX_HEADER_OFFSET = 5
+
+    daily_start_row_idx = start_date.timetuple().tm_yday + DAILY_HEADER_OFFSET - 1
+    daily_end_row_idx = end_date.timetuple().tm_yday + DAILY_HEADER_OFFSET - 1
     
-    daily_data_slice = daily_sheet_df.iloc[start_row_idx : end_row_idx + 1]
-    source_data_slice = source_sheet_df.iloc[start_row_idx : end_row_idx + 1]
+    source_start_row_idx = start_date.timetuple().tm_yday + SOURCE_HEADER_OFFSET - 1
+    source_end_row_idx = end_date.timetuple().tm_yday + SOURCE_HEADER_OFFSET - 1
+    
+    daily_data_slice = daily_sheet_df.iloc[daily_start_row_idx : daily_end_row_idx + 1]
+    source_data_slice = source_sheet_df.iloc[source_start_row_idx : source_end_row_idx + 1]
+
+    if query_year == 2026:
+        nox_start_row_idx = start_date.timetuple().tm_yday + NOX_HEADER_OFFSET - 1
+        nox_end_row_idx = end_date.timetuple().tm_yday + NOX_HEADER_OFFSET - 1
+        nox_data_slice = nox_sheet_df.iloc[nox_start_row_idx : nox_end_row_idx + 1] if not nox_sheet_df.empty else pd.DataFrame()
+    else:
+        nox_data_slice = source_data_slice
 
     # --- 4-A. 폐수 관련 총량 집계 (누적값 기반 사용량 계산) ---
     try:
+        # 2026년은 폐수 데이터의 행 오프셋과 열 위치가 다릅니다.
+        if query_year == 2026:
+            # 'key-in(LO)' 탭은 1월 1일 데이터가 4행에 위치하므로 오프셋을 3으로 설정합니다.
+            WASTEWATER_HEADER_OFFSET = 3
+            water_supply_col = 'AH'
+            pure_water_col1 = 'AB'
+            pure_water_col2 = 'AC'
+            # 2026-05-14 사용자 피드백으로 열 위치 수정
+            discharge_col = 'AG' # 방류수량
+            domestic_col = 'AD'  # 생활용수량
+            # 아래 두 항목은 이전 설정을 유지하거나, 충돌을 피해 추정합니다.
+            power_col = 'AF'
+            cooling_col = 'AE'   # 1차 냉각수량 (기존 discharge_col 이었던 AE로 추정)
+        else:
+            WASTEWATER_HEADER_OFFSET = SOURCE_HEADER_OFFSET
+            water_supply_col = 'I'
+            pure_water_col1 = 'C'
+            pure_water_col2 = 'D'
+            discharge_col = 'H'
+            power_col = 'G'
+            domestic_col = 'E'
+            cooling_col = 'F'
+
+        ww_start_row_idx = start_date.timetuple().tm_yday + WASTEWATER_HEADER_OFFSET - 1
+        ww_end_row_idx = end_date.timetuple().tm_yday + WASTEWATER_HEADER_OFFSET - 1
+
+        if wastewater_df.empty or wastewater_df.shape[0] <= ww_start_row_idx:
+            raise ValueError("폐수 데이터 시트가 비어있거나 데이터가 부족합니다.")
+
         def _safe_to_numeric(value):
             """Helper to convert a single value to numeric, returning 0 for errors or NaN."""
             num = pd.to_numeric(value, errors='coerce')
             return 0 if pd.isna(num) else num
 
-        # 1. 기간 시작 전날의 누적값 가져오기
-        # 파일 내에서 항상 start_row_idx - 1 행에 조회 시작일의 전날(연초인 경우 작년 12월 31일) 누적값이 위치합니다.
-        prev_row_idx = start_row_idx - 1
-        val_I_prev = _safe_to_numeric(source_sheet_df.iloc[prev_row_idx, column_index_from_string('I') - 1])
-        val_C_prev = _safe_to_numeric(source_sheet_df.iloc[prev_row_idx, column_index_from_string('C') - 1])
-        val_D_prev = _safe_to_numeric(source_sheet_df.iloc[prev_row_idx, column_index_from_string('D') - 1])
-        val_H_prev = _safe_to_numeric(source_sheet_df.iloc[prev_row_idx, column_index_from_string('H') - 1])
-        val_G_prev = _safe_to_numeric(source_sheet_df.iloc[prev_row_idx, column_index_from_string('G') - 1])
-        val_E_prev = _safe_to_numeric(source_sheet_df.iloc[prev_row_idx, column_index_from_string('E') - 1])
-        val_F_prev = _safe_to_numeric(source_sheet_df.iloc[prev_row_idx, column_index_from_string('F') - 1])
+        prev_row_idx = ww_start_row_idx - 1
+        val_supply_prev = _safe_to_numeric(wastewater_df.iloc[prev_row_idx, column_index_from_string(water_supply_col) - 1])
+        val_pure1_prev = _safe_to_numeric(wastewater_df.iloc[prev_row_idx, column_index_from_string(pure_water_col1) - 1])
+        val_pure2_prev = _safe_to_numeric(wastewater_df.iloc[prev_row_idx, column_index_from_string(pure_water_col2) - 1])
+        val_discharge_prev = _safe_to_numeric(wastewater_df.iloc[prev_row_idx, column_index_from_string(discharge_col) - 1])
+        val_power_prev = _safe_to_numeric(wastewater_df.iloc[prev_row_idx, column_index_from_string(power_col) - 1])
+        val_domestic_prev = _safe_to_numeric(wastewater_df.iloc[prev_row_idx, column_index_from_string(domestic_col) - 1])
+        val_cooling_prev = _safe_to_numeric(wastewater_df.iloc[prev_row_idx, column_index_from_string(cooling_col) - 1])
 
-        # 2. 사용량 계산 (계량기 교체 및 리셋을 고려하여 일별 사용량 합산)
         def _calculate_cumulative_usage(prev_val, col_letter):
             col_idx = column_index_from_string(col_letter) - 1
-            if col_idx >= source_data_slice.shape[1]: # 열이 존재하지 않으면 0 반환
+            wastewater_data_slice = wastewater_df.iloc[ww_start_row_idx : ww_end_row_idx + 1]
+
+            if col_idx >= wastewater_data_slice.shape[1]:
                 return 0.0
-            s = pd.to_numeric(source_data_slice.iloc[:, col_idx], errors='coerce').dropna()
+            s = pd.to_numeric(wastewater_data_slice.iloc[:, col_idx], errors='coerce').dropna()
             
             total = 0
             current_prev = prev_val
             for val in s:
-                # 누적값이 이전 값의 절반 이하로 떨어지면(큰 폭의 감소) 계량기 리셋/교체로 판단
-                # 소폭 감소(단순 오기입 수정)는 단순 차이값(음수)으로 반영하여 오차를 상쇄시킴
                 if val < current_prev * 0.5 and current_prev > 0:
                     total += val
                 else:
@@ -512,12 +631,12 @@ def load_data(view_type, year=None, month=None, date_obj=None):
                 current_prev = val
             return max(0, total)
 
-        total_water_supply = _calculate_cumulative_usage(val_I_prev, 'I')
-        total_pure_water = _calculate_cumulative_usage(val_C_prev, 'C') + _calculate_cumulative_usage(val_D_prev, 'D')
-        total_discharge = _calculate_cumulative_usage(val_H_prev, 'H')
-        total_wastewater_power = _calculate_cumulative_usage(val_G_prev, 'G')
-        total_domestic_water = _calculate_cumulative_usage(val_E_prev, 'E')
-        total_cooling_water = _calculate_cumulative_usage(val_F_prev, 'F')
+        total_water_supply = _calculate_cumulative_usage(val_supply_prev, water_supply_col)
+        total_pure_water = _calculate_cumulative_usage(val_pure1_prev, pure_water_col1) + _calculate_cumulative_usage(val_pure2_prev, pure_water_col2)
+        total_discharge = _calculate_cumulative_usage(val_discharge_prev, discharge_col)
+        total_wastewater_power = _calculate_cumulative_usage(val_power_prev, power_col)
+        total_domestic_water = _calculate_cumulative_usage(val_domestic_prev, domestic_col)
+        total_cooling_water = _calculate_cumulative_usage(val_cooling_prev, cooling_col)
         
         summary_data = {
             '총 상수도 사용량': total_water_supply,
@@ -534,13 +653,23 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     # --- 4-C. 외부수열 관련 총량 집계 ---
     external_heat_summary = create_empty_external_heat_data() # Initialize with empty data
 
-    external_heat_cols = {
-        '남부소각장': 'AD',
-        'ERG': 'AE',
-        'SRF': 'AF',
-        '인천종합에너지': 'AG',
-        '안산도시개발': 'AH'
-    }
+    # 2026년 데이터는 외부수열처의 열 위치가 다르므로 분기 처리합니다.
+    if query_year == 2026:
+        external_heat_cols = {
+            '남부소각장': 'N',
+            'ERG': 'P',
+            'SRF': 'Q',
+            '인천종합에너지': 'Z',
+            '안산도시개발': 'AB'
+        }
+    else:
+        external_heat_cols = {
+            '남부소각장': 'AD',
+            'ERG': 'AE',
+            'SRF': 'AF',
+            '인천종합에너지': 'AG',
+            '안산도시개발': 'AH'
+        }
 
     try:
         for facility_name, col_letter in external_heat_cols.items():
@@ -557,8 +686,14 @@ def load_data(view_type, year=None, month=None, date_obj=None):
     # --- 4-B. 설비별 데이터 집계 ---
     final_data = {}
     facility_cols = {'CHP': 'AH', 'PLB #1': 'AI', 'PLB #2': 'AJ', 'PLB #3': 'AK'}
-    heat_prod_cols = {'CHP': 'W', 'PLB #1': 'X', 'PLB #2': 'Y', 'PLB #3': 'Z'}
-    plb_lng_cols = {'PLB #1': 'N', 'PLB #2': 'O', 'PLB #3': 'P'}
+    
+    # 2026년 파일은 열 위치가 다르므로 CHP 열 생산량 및 PLB LNG 사용량 열 위치를 조정합니다.
+    if query_year == 2026:
+        heat_prod_cols = {'CHP': 'F', 'PLB #1': 'G', 'PLB #2': 'H', 'PLB #3': 'I'}
+        plb_lng_cols = {'PLB #1': 'BC', 'PLB #2': 'BD', 'PLB #3': 'BE'}
+    else:
+        heat_prod_cols = {'CHP': 'W', 'PLB #1': 'X', 'PLB #2': 'Y', 'PLB #3': 'Z'}
+        plb_lng_cols = {'PLB #1': 'N', 'PLB #2': 'O', 'PLB #3': 'P'}
 
     # [신규] 2025, 2026년 NOx 계산을 위한 사전 집계
     use_ac_col_for_nox = query_year in [2025, 2026]
@@ -568,10 +703,10 @@ def load_data(view_type, year=None, month=None, date_obj=None):
         try:
             # AC열에서 해당 기간의 총 NOx 배출량 합산
             nox_col_idx = column_index_from_string('AC') - 1
-            if nox_col_idx < source_data_slice.shape[1]:
-                total_nox_from_ac = pd.to_numeric(source_data_slice.iloc[:, nox_col_idx], errors='coerce').sum()
-            else:
-                total_nox_from_ac = 0.0
+            target_nox_slice = nox_data_slice if query_year == 2026 else source_data_slice
+            
+            if not target_nox_slice.empty and nox_col_idx < target_nox_slice.shape[1]:
+                total_nox_from_ac = pd.to_numeric(target_nox_slice.iloc[:, nox_col_idx], errors='coerce').sum()
         except Exception as e:
             st.warning(f"{query_year}년 NOx 배출량 사전 집계 중 오류 발생: {e}")
             use_ac_col_for_nox = False # 오류 발생 시 기존 방식으로 계산하도록 플래그 변경
@@ -582,23 +717,36 @@ def load_data(view_type, year=None, month=None, date_obj=None):
             daily_col_idx = column_index_from_string(daily_col_letter) - 1
 
             # 가동 시간, 열 생산량 (기간 합산)
-            facility_data_row['가동 시간 (hr)'] = pd.to_numeric(daily_data_slice[daily_col_idx], errors='coerce').sum()
+            if daily_col_idx < daily_data_slice.shape[1]:
+                facility_data_row['가동 시간 (hr)'] = pd.to_numeric(daily_data_slice.iloc[:, daily_col_idx], errors='coerce').sum()
+            else:
+                facility_data_row['가동 시간 (hr)'] = 0.0
             
             heat_prod_col_idx = column_index_from_string(heat_prod_cols[facility_name]) - 1
-            facility_data_row['열 생산량 (Gcal)'] = pd.to_numeric(source_data_slice[heat_prod_col_idx], errors='coerce').sum()
+            if heat_prod_col_idx < source_data_slice.shape[1]:
+                facility_data_row['열 생산량 (Gcal)'] = pd.to_numeric(source_data_slice.iloc[:, heat_prod_col_idx], errors='coerce').sum()
+            else:
+                facility_data_row['열 생산량 (Gcal)'] = 0.0
 
             # 연누적 가동 시간 (기간의 마지막 날 기준 누적치)
-            CUMULATIVE_START_ROW_IDX = 1 + HEADER_OFFSET - 1
-            cumulative_end_row_idx = end_row_idx
-            facility_data_row['연누적 가동 시간 (hr)'] = pd.to_numeric(daily_sheet_df.iloc[CUMULATIVE_START_ROW_IDX : cumulative_end_row_idx + 1, daily_col_idx], errors='coerce').sum()
+            CUMULATIVE_START_ROW_IDX = 1 + DAILY_HEADER_OFFSET - 1
+            cumulative_end_row_idx = daily_end_row_idx
+            if daily_col_idx < daily_sheet_df.shape[1]:
+                facility_data_row['연누적 가동 시간 (hr)'] = pd.to_numeric(daily_sheet_df.iloc[CUMULATIVE_START_ROW_IDX : cumulative_end_row_idx + 1, daily_col_idx], errors='coerce').sum()
+            else:
+                facility_data_row['연누적 가동 시간 (hr)'] = 0.0
 
             # 온실가스 및 NOx 배출량 (기간 합산)
             total_ghg = 0
             total_nox = 0
 
             if facility_name == 'CHP':
-                lng_usage_col_idx = column_index_from_string('M') - 1
-                lng_usages = pd.to_numeric(source_data_slice[lng_usage_col_idx], errors='coerce').fillna(0)
+                chp_lng_col = 'BB' if query_year == 2026 else 'M'
+                lng_usage_col_idx = column_index_from_string(chp_lng_col) - 1
+                if lng_usage_col_idx < source_data_slice.shape[1]:
+                    lng_usages = pd.to_numeric(source_data_slice.iloc[:, lng_usage_col_idx], errors='coerce').fillna(0)
+                else:
+                    lng_usages = pd.Series([0.0] * len(source_data_slice))
                 facility_data_row['LNG 사용량 (m³)'] = lng_usages.sum()
                 
                 # 온실가스 배출량 (tCO₂) = LNG사용량 * ((56100*38.9*0.995/10^6*1)+(1*38.9*1/10^6*21)+(0.1*38.9*1/10^6*310))/1000
@@ -618,7 +766,10 @@ def load_data(view_type, year=None, month=None, date_obj=None):
             else: # PLB
                 lng_col_letter = plb_lng_cols[facility_name]
                 lng_usage_col_idx = column_index_from_string(lng_col_letter) - 1
-                lng_usages = pd.to_numeric(source_data_slice[lng_usage_col_idx], errors='coerce').fillna(0)
+                if lng_usage_col_idx < source_data_slice.shape[1]:
+                    lng_usages = pd.to_numeric(source_data_slice.iloc[:, lng_usage_col_idx], errors='coerce').fillna(0)
+                else:
+                    lng_usages = pd.Series([0.0] * len(source_data_slice))
                 facility_data_row['LNG 사용량 (m³)'] = lng_usages.sum()
                 
                 # GHG
@@ -641,7 +792,7 @@ def load_data(view_type, year=None, month=None, date_obj=None):
             st.warning(f"'{facility_name}' 데이터 집계 중 오류 발생: {e}")
             final_data[facility_name] = {
                 '가동 시간 (hr)': 0, '연누적 가동 시간 (hr)': 0, '열 생산량 (Gcal)': 0,
-                '온실가스 배출량 (tCO₂)': 0, 'NOx 배출량 (kg)': 0
+                'LNG 사용량 (m³)': 0, '온실가스 배출량 (tCO₂)': 0, 'NOx 배출량 (kg)': 0
             }
 
     # --- 5. 최종 데이터프레임 생성 ---
@@ -2002,4 +2153,5 @@ if selected_tab == "기간별 운영 현황":
                     """
                     components.html(html_code, height=450)
                 else:
+                    st.info("연도별 비교 데이터가 없습니다.")
                     st.info("연도별 비교 데이터가 없습니다.")
